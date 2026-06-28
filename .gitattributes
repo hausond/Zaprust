@@ -1,0 +1,12 @@
+# Нормализуем перевод строк автоматически
+* text=auto
+
+# Бинарные ассеты — не трогать
+*.png  binary
+*.ico  binary
+*.svg  text
+*.bin  binary
+*.sys  binary
+*.dll  binary
+*.exe  binary
+*.zip  binary
