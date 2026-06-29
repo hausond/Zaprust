@@ -1812,22 +1812,34 @@ impl Probe {
     /// Для HTTPS это время TLS-хендшейка + TTFB (тело не качаем) — именно оно
     /// различает стратегии по обработке ClientHello. Для пинга используем его.
     fn check_timed(&self, agent: &ureq::Agent) -> (bool, u128) {
+        let d = self.check_detail(agent);
+        (d.0, d.1)
+    }
+
+    /// Как check_timed, но с причиной отказа (для диагностики автоподбора):
+    /// (достижимо, мс, причина: "ok" / "dns: …" / "io: …" / "tcp: …").
+    fn check_detail(&self, agent: &ureq::Agent) -> (bool, u128, String) {
         let start = Instant::now();
-        let ok = match self {
+        let (ok, why) = match self {
             Probe::Https(url) => match agent.get(url).call() {
-                Ok(_) => true,
-                Err(ureq::Error::Status(_, _)) => true, // сервер ответил — домен доступен
-                Err(_) => false,
+                Ok(_) => (true, "ok".to_owned()),
+                Err(ureq::Error::Status(code, _)) => (true, format!("http {code}")),
+                Err(ureq::Error::Transport(t)) => {
+                    (false, format!("{:?}: {t}", t.kind()).replace('\n', " "))
+                }
             },
             Probe::Tcp(addr) => match addr.to_socket_addrs() {
-                Ok(mut addrs) => addrs
-                    .next()
-                    .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(3)).is_ok())
-                    .unwrap_or(false),
-                Err(_) => false,
+                Ok(mut addrs) => match addrs.next() {
+                    Some(sa) => match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+                        Ok(_) => (true, "ok".to_owned()),
+                        Err(e) => (false, format!("tcp: {e}")),
+                    },
+                    None => (false, "нет адреса".to_owned()),
+                },
+                Err(e) => (false, format!("dns: {e}")),
             },
         };
-        (ok, start.elapsed().as_millis())
+        (ok, start.elapsed().as_millis(), why)
     }
 }
 
@@ -1932,7 +1944,45 @@ fn install_service_elevated(strategy_name: &str, game_filter: bool) -> Result<()
         return Err(format!("не найден {}", exe.display()));
     }
     let args = strategies::resolve_game_filter(&strategy.args, game_filter);
-    service::install(&exe, &args, strategy_name)
+    ensure_user_lists(&args);
+
+    // Сбрасываем драйвер WinDivert перед установкой: прошлый winws (упавший/убитый,
+    // в т.ч. после неудачного автоподбора) мог оставить драйвер занятым — тогда
+    // winws службы стартует и сразу падает (код 1), служба остаётся Stopped.
+    logging::info("svc", "сброс драйвера WinDivert перед установкой службы");
+    service::stop_driver();
+    std::thread::sleep(Duration::from_millis(800));
+
+    let res = service::install(&exe, &args, strategy_name);
+
+    // Если служба установилась, но winws не поднялся — снимаем собственный вывод
+    // winws (запуск напрямую, с захватом stdout/stderr), чтобы увидеть причину.
+    if res.is_ok() && service::winws_alive().is_none() {
+        logging::error("svc", "служба установлена, но winws не запущен — диагностический прогон winws");
+        match spawn_winws(&core_dir, &args) {
+            Ok(mut c) => {
+                std::thread::sleep(Duration::from_millis(2000));
+                let early = c.try_wait().ok().flatten();
+                let _ = c.kill();
+                let _ = c.wait();
+                let out = winws_last_output();
+                logging::error(
+                    "svc",
+                    format!(
+                        "диагностика winws: {}{}",
+                        match early {
+                            Some(st) => format!("вышел код {:?}", st.code()),
+                            None => "остался жив при прямом запуске (проблема в режиме службы)".to_owned(),
+                        },
+                        if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
+                    ),
+                );
+            }
+            Err(e) => logging::error("svc", format!("диагностика: winws не запустился: {e}")),
+        }
+    }
+
+    res
 }
 
 /// GUI-сторона обновления (без прав): проверка → скачивание → элевированная замена.
@@ -2087,6 +2137,9 @@ fn apply_update_command(args: &[String]) -> i32 {
 
 // ── Автоподбор стратегии (killer-фича) ───────────────────────────────────────
 
+/// Прогрев winws перед замером (драйвер WinDivert привязывается).
+const WARMUP_MS: u64 = 900;
+
 /// Контрольные цели для отбора (минимум): YouTube + Discord по TLS.
 fn autoselect_targets() -> Vec<Probe> {
     vec![
@@ -2141,16 +2194,68 @@ fn median(v: &[u128]) -> u128 {
     s[s.len() / 2]
 }
 
-/// Спавн winws скрыто (CREATE_NO_WINDOW), без пайпов.
+/// Создать недостающие пользовательские списки (`*-user.txt`), на которые ссылаются
+/// аргументы winws. Оригинальные `.bat` Flowseal создают их пустыми через
+/// `service.bat load_user_lists`; мы запускаем winws напрямую, поэтому делаем сами.
+/// Без этого winws на отсутствующем `--ipset-exclude=…-user.txt` падает с кодом 1.
+fn ensure_user_lists(args: &[String]) {
+    for a in args {
+        let path = a.rsplit('=').next().unwrap_or(a).trim_matches('"');
+        if !path.ends_with("-user.txt") {
+            continue;
+        }
+        let p = std::path::Path::new(path);
+        if p.exists() {
+            continue;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::write(p, b"") {
+            Ok(_) => logging::info("lists", format!("создан недостающий список: {path}")),
+            Err(e) => logging::warn("lists", format!("не создать список {path}: {e}")),
+        }
+    }
+}
+
+/// Файл, куда пишется вывод winws при пробах (для диагностики кода выхода).
+fn winws_output_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("zaprust_winws.out")
+}
+
+/// Последние строки вывода winws (его собственная диагностика об ошибке).
+fn winws_last_output() -> String {
+    std::fs::read_to_string(winws_output_path())
+        .map(|t| {
+            t.lines()
+                .filter(|l| !l.trim().is_empty())
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default()
+}
+
+/// Спавн winws скрыто (CREATE_NO_WINDOW). stdout+stderr → temp-файл (безопасно,
+/// в отличие от недренируемого пайпа), чтобы видеть причину кода выхода winws.
 fn spawn_winws(core_dir: &std::path::Path, args: &[String]) -> std::io::Result<std::process::Child> {
     let bin_dir = core_dir.join("bin");
     let exe = bin_dir.join("winws.exe");
     let mut cmd = Command::new(&exe);
-    cmd.args(args)
-        .current_dir(&bin_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.args(args).current_dir(&bin_dir).stdin(Stdio::null());
+    match std::fs::File::create(winws_output_path()) {
+        Ok(file) => {
+            let err = file.try_clone().map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+            cmd.stdout(Stdio::from(file)).stderr(err);
+        }
+        Err(_) => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2159,17 +2264,17 @@ fn spawn_winws(core_dir: &std::path::Path, args: &[String]) -> std::io::Result<s
     cmd.spawn()
 }
 
-/// Параллельно замерить цели: вернуть (достижимо, мс) по каждой в исходном порядке.
-fn measure_targets(targets: &[Probe], agent: &ureq::Agent) -> Vec<(bool, u128)> {
+/// Параллельно замерить цели: вернуть (достижимо, мс, причина) по каждой в исходном порядке.
+fn measure_targets(targets: &[Probe], agent: &ureq::Agent) -> Vec<(bool, u128, String)> {
     let mut handles = Vec::with_capacity(targets.len());
     for t in targets {
         let a = agent.clone();
         let t = t.clone();
-        handles.push(std::thread::spawn(move || t.check_timed(&a)));
+        handles.push(std::thread::spawn(move || t.check_detail(&a)));
     }
     handles
         .into_iter()
-        .map(|h| h.join().unwrap_or((false, 0)))
+        .map(|h| h.join().unwrap_or((false, 0, "join error".to_owned())))
         .collect()
 }
 
@@ -2184,19 +2289,53 @@ fn probe_strategy(
     agent: &ureq::Agent,
 ) -> Option<u32> {
     let args = strategies::resolve_game_filter(&s.args, game_filter);
-    let mut child = spawn_winws(core_dir, &args).ok()?;
-    std::thread::sleep(Duration::from_millis(400)); // warmup — WinDivert привязывается
+    let mut child = match spawn_winws(core_dir, &args) {
+        Ok(c) => c,
+        Err(e) => {
+            logging::error("autoselect", format!("[{}] не запустился winws: {e}", s.name));
+            return None;
+        }
+    };
+    std::thread::sleep(Duration::from_millis(WARMUP_MS)); // прогрев — WinDivert привязывается
 
-    // Гейт: все цели должны пройти.
+    // Если winws мгновенно умер — частая причина (AV/драйвер/аргументы).
+    if let Ok(Some(status)) = child.try_wait() {
+        let out = winws_last_output();
+        logging::error(
+            "autoselect",
+            format!(
+                "[{}] winws сразу вышел (код {:?}){}",
+                s.name,
+                status.code(),
+                if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
+            ),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        return None;
+    }
+
+    // Гейт: все цели должны пройти. Логируем причину по каждой.
     let gate = measure_targets(targets, agent);
-    let passed = gate.iter().all(|(ok, _)| *ok);
+    for (t, (ok, ms, why)) in targets.iter().zip(gate.iter()) {
+        logging::info(
+            "autoselect",
+            format!(
+                "[{}] {} → {} {ms}ms{}",
+                s.name,
+                t.label(),
+                if *ok { "OK" } else { "FAIL" },
+                if *ok { String::new() } else { format!(" ({why})") }
+            ),
+        );
+    }
+    let passed = gate.iter().all(|(ok, _, _)| *ok);
 
     let ping = if passed {
         // Медиана из 3 замеров на цель (гейт + ещё 2) — только у кандидатов.
-        let mut samples: Vec<Vec<u128>> = gate.iter().map(|(_, ms)| vec![*ms]).collect();
+        let mut samples: Vec<Vec<u128>> = gate.iter().map(|(_, ms, _)| vec![*ms]).collect();
         for _ in 0..2 {
             let extra = measure_targets(targets, agent);
-            for (i, (ok, ms)) in extra.iter().enumerate() {
+            for (i, (ok, ms, _)) in extra.iter().enumerate() {
                 if *ok {
                     samples[i].push(*ms);
                 }
@@ -2226,13 +2365,17 @@ fn verify_winner(
     let Ok(mut child) = spawn_winws(core_dir, &args) else {
         return false;
     };
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(Duration::from_millis(WARMUP_MS));
     let results = measure_targets(full, agent);
     let _ = child.kill();
     let _ = child.wait();
     std::thread::sleep(Duration::from_millis(250));
 
-    let ok = results.iter().filter(|(o, _)| *o).count();
+    let ok = results.iter().filter(|(o, _, _)| *o).count();
+    logging::info(
+        "autoselect",
+        format!("верификация {}: {ok}/{} целей доступно", s.name, results.len()),
+    );
     !results.is_empty() && ok * 100 >= results.len() * 70
 }
 
@@ -2356,6 +2499,68 @@ fn autoselect_command(args: &[String]) -> i32 {
     let total = ordered.len();
     let sel = autoselect_targets();
     let agent = build_probe_agent();
+    logging::info(
+        "autoselect",
+        format!("старт: {total} стратегий, game_filter={game_filter}, lkg={lkg:?}"),
+    );
+
+    // Создаём недостающие *-user.txt для всех стратегий: иначе winws каждой пробы
+    // падает с кодом 1 на отсутствующем ipset-файле (на свежем ядре их нет).
+    for s in &ordered {
+        ensure_user_lists(&strategies::resolve_game_filter(&s.args, game_filter));
+    }
+
+    // КРИТИЧНО: снимаем уже стоящую службу/процесс winws перед подбором — иначе
+    // их winws держит WinDivert, и winws КАЖДОЙ пробы конфликтует и падает (код 1).
+    if service::query(service::SERVICE_NAME).installed() || service::winws_alive().is_some() {
+        logging::info("autoselect", "снимаю активную службу/winws перед подбором");
+        let _ = service::remove();
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    // И сбрасываем сам драйвер WinDivert: прошлый winws (в т.ч. упавший/убитый при
+    // ручном старте) мог оставить драйвер в занятом состоянии — тогда КАЖДЫЙ
+    // следующий winws падает с кодом 1. Чистый старт драйвера снимает это.
+    logging::info("autoselect", "сброс драйвера WinDivert перед подбором");
+    service::stop_driver();
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Прайм драйвера WinDivert: на чистой машине ПЕРВЫЙ запуск winws ставит/грузит
+    // драйвер заметно дольше прогрева — поднимаем winws один раз и ждём, иначе
+    // первые (а то и все) пробы падают из-за непрогретого драйвера. Заодно ловим
+    // вывод winws — если он сразу падает, тут будет видна настоящая причина.
+    if let Some(first) = ordered.first() {
+        let pargs = strategies::resolve_game_filter(&first.args, game_filter);
+        match spawn_winws(&core_dir, &pargs) {
+            Ok(mut c) => {
+                logging::info("autoselect", "прайм WinDivert: winws поднят, жду 1800мс");
+                std::thread::sleep(Duration::from_millis(1800));
+                let early = c.try_wait().ok().flatten();
+                let _ = c.kill();
+                let _ = c.wait();
+                std::thread::sleep(Duration::from_millis(300));
+                let out = winws_last_output();
+                match early {
+                    Some(st) => logging::error(
+                        "autoselect",
+                        format!(
+                            "прайм: winws сразу вышел (код {:?}){}",
+                            st.code(),
+                            if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
+                        ),
+                    ),
+                    None => logging::info(
+                        "autoselect",
+                        format!(
+                            "прайм завершён, WinDivert: {:?}{}",
+                            service::query("WinDivert"),
+                            if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
+                        ),
+                    ),
+                }
+            }
+            Err(e) => logging::error("autoselect", format!("прайм: winws не запустился: {e}")),
+        }
+    }
 
     // Быстрый путь: last-known-good. Прошёл гейт → ставим сразу.
     if let Some(name) = &lkg {
@@ -2416,12 +2621,17 @@ fn autoselect_command(args: &[String]) -> i32 {
 
     // Выбор: мин. сумма пингов; тай-брейк (<15 мс) → раньше по порядку (general/lkg).
     if candidates.is_empty() {
+        logging::warn(
+            "autoselect",
+            "ни одна стратегия не пробила YouTube+Discord. Если в логах по целям видно 'dns:' — у провайдера блокировка DNS: включите Secure DNS (DoH) в браузере/системе. winws не обходит DNS-блокировку.",
+        );
         write_progress(&AutoProgress {
             stage: "none".to_owned(),
             ..Default::default()
         });
         return 3;
     }
+    logging::info("autoselect", format!("кандидатов прошло: {}", candidates.len()));
     candidates.sort_by_key(|c| c.1);
     let best_ping = candidates[0].1;
     let winner = candidates
