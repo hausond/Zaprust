@@ -3,6 +3,8 @@ name = "zaprust"
 version = "0.1.2"
 edition = "2021"
 description = "Lightweight native GUI over Flowseal/zapret-discord-youtube for managing DPI bypass"
+license = "MIT"
+repository = "https://github.com/hausond/Zaprust"
 
 [dependencies]
 eframe = "0.29"

@@ -182,4 +182,6 @@ Zaprust — независимый сторонний GUI и **не аффили
 
 ## Лицензия
 
-Лицензия не выбрана. Перед публикацией добавьте файл `LICENSE` (например, MIT) — учтите лицензии используемых зависимостей и ядра zapret.
+Исходный код Zaprust распространяется под лицензией [MIT](LICENSE).
+
+Zaprust — отдельная оболочка и **не включает** код zapret. Движок (`winws.exe`, драйвер WinDivert) и стратегии/списки поставляются [bol-van/zapret](https://github.com/bol-van/zapret) и [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) под их собственными лицензиями — действие лицензии Zaprust на них не распространяется.
