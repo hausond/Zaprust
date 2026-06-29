@@ -44,10 +44,15 @@ pub fn find_core_dir() -> Option<PathBuf> {
             candidates.push(dir.join("core"));
         }
     }
-    // dev: папка проекта (зашита на этапе компиляции)
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("core"));
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("core"));
+    // Только dev-сборка: ядро в дереве исходников (зашитый CARGO_MANIFEST_DIR) и
+    // относительно cwd. В release этого НЕТ — иначе release-exe находил бы чужое
+    // ядро по вкомпиленному абсолютному пути проекта (и не предлагал «Скачать»).
+    #[cfg(debug_assertions)]
+    {
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("core"));
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("core"));
+        }
     }
 
     candidates.into_iter().find(|p| p.is_dir())
@@ -57,14 +62,15 @@ pub fn find_core_dir() -> Option<PathBuf> {
 pub fn preferred_core_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // В dev (exe в target/…) кладём к проекту, иначе — рядом с exe.
+            // Только dev: exe в target/… → кладём ядро к проекту для удобства.
+            #[cfg(debug_assertions)]
             if dir.ends_with("debug") || dir.ends_with("release") {
                 return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("core");
             }
             return dir.join("core");
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("core")
+    std::env::current_dir().unwrap_or_default().join("core")
 }
 
 /// Просканировать ядро: найти папку, перечислить и распарсить стратегии.
