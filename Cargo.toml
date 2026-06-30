@@ -1,0 +1,53 @@
+[package]
+name = "zaprust"
+version = "0.2.0"
+edition = "2021"
+description = "Cross-platform native GUI over zapret/Flowseal for managing DPI bypass (Windows + Linux)"
+license = "MIT"
+repository = "https://github.com/hausond/Zaprust"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+# Тест доступности доменов. TLS-бэкенд — за платформенным слоем (Tester):
+# Windows — native-tls/SChannel, Linux — rustls (придёт в L6). В общем коде ureq
+# без TLS-фич, чтобы OpenSSL не тянулся в Linux-сборку; native-tls добавляется
+# только под Windows ниже.
+ureq = { version = "2", default-features = false }
+# Распаковка релизного архива ядра (только deflate — легко).
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# Сохранение настроек.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+# Декодирование PNG-иконок интерфейса (только png — легко).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+# TLS-бэкенд теста на Windows: native-tls = SChannel. Фича ureq добавляется
+# только здесь — Cargo сольёт её с общим ureq лишь в Windows-сборке.
+native-tls = "0.2"
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# L2: перехват Ctrl-C в ручном foreground-прогоне движка из-под root, чтобы при
+# выходе гарантированно снять правила nftables/iptables (иначе они бы повисли).
+# Фича "termination" ловит ещё SIGTERM/SIGHUP (закрытие терминала, kill) — без неё
+# закрытый терминал оставлял бы живой nfqws + правила и рвал всю сеть.
+ctrlc = { version = "3", features = ["termination"] }
+# L6: TLS-бэкенд теста на Linux — rustls (фича ureq "tls" = rustls + ring +
+# встроенные корни webpki-roots). В отличие от native-tls НЕ тянет системный
+# OpenSSL `.so` (важно для переносимого AppImage). Cargo сольёт эту фичу с общим
+# ureq лишь в Linux-сборке; AgentBuilder при включённой фиче берёт rustls сам.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Метаданные exe (иконка, версия, манифест) — только в release-сборке.
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

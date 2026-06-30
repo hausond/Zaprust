@@ -1,4 +1,6 @@
-// Персист настроек: %APPDATA%\Zaprust\config.json.
+// Персист настроек. Путь даёт платформенный слой (`Paths::config_path`):
+// Windows — `%APPDATA%\Zaprust\config.json`; Linux — `$XDG_CONFIG_HOME/zaprust`
+// (фолбэк `~/.config/zaprust`).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -47,12 +49,15 @@ impl Config {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, text);
+            if std::fs::write(&path, text).is_ok() {
+                // На случай записи из-под root — оставить файл за исходным
+                // пользователем (no-op в обычном GUI и на Windows).
+                crate::platform::host().fixup_owner(&path);
+            }
         }
     }
 
     fn path() -> Option<PathBuf> {
-        directories::BaseDirs::new()
-            .map(|b| b.config_dir().join("Zaprust").join("config.json"))
+        crate::platform::host().config_path()
     }
 }

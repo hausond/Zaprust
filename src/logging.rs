@@ -52,6 +52,12 @@ pub fn init(role: &str) {
     }
     let path = pick_log_path();
     rotate(&path);
+    // Гарантируем существование лог-файла за корректным владельцем: если первым в
+    // него пишет элевированный (root) реинвок, без этого файл создастся с владельцем
+    // root, и неэлевированный GUI потом не сможет дописывать (см. L8, права user↔root).
+    if OpenOptions::new().create(true).append(true).open(&path).is_ok() {
+        crate::platform::host().fixup_owner(&path);
+    }
     let min = if cfg!(debug_assertions) {
         Level::Debug
     } else {
@@ -85,6 +91,8 @@ pub fn warn(component: &str, msg: impl AsRef<str>) {
 pub fn info(component: &str, msg: impl AsRef<str>) {
     write(Level::Info, component, msg.as_ref());
 }
+// Используется платформенной реализацией Windows (вывод `sc`); на Linux пока нет.
+#[allow(dead_code)]
 pub fn debug(component: &str, msg: impl AsRef<str>) {
     write(Level::Debug, component, msg.as_ref());
 }
@@ -134,23 +142,16 @@ pub fn recent_problems(n: usize) -> Vec<String> {
 // ── Внутреннее ───────────────────────────────────────────────────────────────
 
 fn pick_log_path() -> PathBuf {
-    // 1) logs/ рядом с exe (портабл).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let logs = dir.join("logs");
-            if std::fs::create_dir_all(&logs).is_ok() && writable(&logs) {
-                return logs.join("zaprust.log");
-            }
+    // Платформенные кандидаты (Win: рядом с exe → %LOCALAPPDATA%\Zaprust\logs;
+    // Linux: XDG state-каталог исходного пользователя). Берём первый создаваемый и
+    // пишемый; под root сразу правим владельца каталога на исходного пользователя.
+    for dir in crate::platform::host().log_dirs() {
+        if std::fs::create_dir_all(&dir).is_ok() && writable(&dir) {
+            crate::platform::host().fixup_owner(&dir);
+            return dir.join("zaprust.log");
         }
     }
-    // 2) %LOCALAPPDATA%\Zaprust\logs.
-    if let Some(base) = directories::BaseDirs::new() {
-        let logs = base.data_local_dir().join("Zaprust").join("logs");
-        if std::fs::create_dir_all(&logs).is_ok() && writable(&logs) {
-            return logs.join("zaprust.log");
-        }
-    }
-    // 3) %TEMP%.
+    // Последний фолбэк — системный temp.
     std::env::temp_dir().join("zaprust.log")
 }
 

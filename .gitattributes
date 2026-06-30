@@ -1,12 +1,15 @@
 # Нормализуем перевод строк автоматически
 * text=auto
 
+# Скрипты — всегда LF (иначе ломаются под bash на Linux).
+*.sh    text eol=lf
+
 # Бинарные ассеты — не трогать
-*.png  binary
-*.ico  binary
-*.svg  text
-*.bin  binary
-*.sys  binary
-*.dll  binary
-*.exe  binary
-*.zip  binary
+*.png   binary
+*.ico   binary
+*.svg   text
+*.bin   binary
+*.sys   binary
+*.dll   binary
+*.exe   binary
+*.zip   binary

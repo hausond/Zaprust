@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!--
+  ОПЦИОНАЛЬНАЯ polkit-policy для Zaprust (шаг L4).
+
+  Назначение: при привилегированном реинвоке (`pkexec <zaprust> --svc …`)
+  показывать ВНЯТНЫЙ диалог аутентификации вместо обобщённого
+  «Authentication is required to run a program as another user».
+
+  Когда нужна: только при СИСТЕМНОЙ установке Zaprust в фиксированный путь
+  (например, distro-пакет в /usr/bin/zaprust). Файл кладётся в
+  /usr/share/polkit-1/actions/dev.zaprust.policy и сам требует прав на запись
+  при установке — это делает установщик пакета.
+
+  Для портабл/AppImage-поставки policy НЕ ставится: путь к бинарю динамический
+  (AppImage монтируется в /tmp/.mount_*), привязать его к фиксированному
+  action нельзя, и заводить системный файл при «просто скачал и запустил»
+  неуместно. Там используется дефолтный pkexec-диалог
+  (org.freedesktop.policykit.exec) — он рабочий, просто формулировка обобщённая.
+
+  ВАЖНО: <annotate key="org.freedesktop.policykit.exec.path"> должен указывать
+  на РЕАЛЬНЫЙ путь установленного бинаря. Подставьте его при пакетировании.
+-->
+<policyconfig>
+  <vendor>Zaprust</vendor>
+  <vendor_url>https://github.com/</vendor_url>
+
+  <action id="dev.zaprust.manage">
+    <description>Управление обходом DPI (Zaprust)</description>
+    <description xml:lang="en">Manage DPI bypass (Zaprust)</description>
+    <message>Для настройки обхода DPI (правила фаервола, служба, ядро) нужны права администратора.</message>
+    <message xml:lang="en">Authentication is required to configure the DPI bypass (firewall rules, service, core).</message>
+    <icon_name>network-vpn</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!-- auth_admin_keep: один ввод пароля «помнится» недолго, чтобы серия
+           под-операций не плодила диалоги (но L7 и так делает один pkexec на
+           всю логическую операцию). -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/zaprust</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

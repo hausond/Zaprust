@@ -1,0 +1,125 @@
+name: release
+
+# Релизная сборка для обеих платформ из ОДНОГО репозитория. По пушу тега vX.Y.Z:
+#   • Windows  → портабл-zip  (Zaprust-<ver>-windows-x86_64.zip)
+#   • Linux    → AppImage      (Zaprust-<ver>-x86_64.AppImage)
+# и прикладывает ОБА артефакта к ОДНОМУ GitHub-релизу по этому тегу.
+# Без тега (workflow_dispatch / push в ветку) — только собирает и кладёт
+# артефакты в run, релиз не трогает.
+#
+# ── Расположение крейта ───────────────────────────────────────────────────────
+# Cargo.toml лежит в КОРНЕ репозитория (CRATE_DIR='.'). Если крейт переедет в
+# подкаталог — поменяй CRATE_DIR ниже, шаги и пути к артефактам это учитывают.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Нужно для заливки ассетов в релиз (softprops/action-gh-release).
+permissions:
+  contents: write
+
+env:
+  # Каталог крейта относительно корня репозитория ('.' = корень).
+  CRATE_DIR: .
+
+jobs:
+  # ── Windows: портабл-zip ────────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ${{ env.CRATE_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.CRATE_DIR }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Stage portable zip
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          if (-not $ver) { $ver = "dev" }
+          $stage = "dist/stage/Zaprust"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target/release/zaprust.exe" "$stage/"
+          Copy-Item "PACKAGE_README.txt" "$stage/README.txt"
+          Compress-Archive "dist/stage/Zaprust" "dist/Zaprust-$ver-windows-x86_64.zip" -Force
+
+      - name: Upload run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zaprust-windows-zip
+          path: ${{ env.CRATE_DIR }}/dist/Zaprust-*-windows-x86_64.zip
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.CRATE_DIR }}/dist/Zaprust-*-windows-x86_64.zip
+          fail_on_unmatched_files: true
+
+  # ── Linux: AppImage ─────────────────────────────────────────────────────────
+  # Собираем на старом ubuntu (минимальный glibc) ради широкой совместимости:
+  # бинарь, слинкованный на новом glibc, не запустится на более старом, а наоборот
+  # работает. X11/Wayland/GL/libxkbcommon приложение грузит через dlopen — их в
+  # образ НЕ кладём (есть на любом десктопе). nfqws тоже не вкладываем — тянется
+  # в XDG-data при первом запуске.
+  linux:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ${{ env.CRATE_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.CRATE_DIR }}
+
+      - name: System build deps for egui
+        # Заголовки/либы, нужные для сборки egui/winit/arboard под Linux.
+        # FUSE НЕ ставим — build-appimage.sh гоняет тулы в extract-and-run.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: bash packaging/linux/build-appimage.sh
+
+      - name: Upload run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zaprust-linux-appimage
+          path: ${{ env.CRATE_DIR }}/dist/Zaprust-*-x86_64.AppImage
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.CRATE_DIR }}/dist/Zaprust-*-x86_64.AppImage
+          fail_on_unmatched_files: true

@@ -125,6 +125,101 @@ pub fn fetch_default_list(agent: &ureq::Agent, file_name: &str) -> Result<Vec<u8
     Err(format!("в релизе нет lists/{file_name}"))
 }
 
+// ── Движок nfqws (bol-van/zapret) — только Linux ─────────────────────────────
+//
+// На Linux ядро = ДВА источника (см. L8): ассеты Flowseal (стратегии/.bin/списки)
+// + движок `nfqws`. Движок берём из релизов bol-van/zapret — там же, откуда родом
+// winws (winws — порт nfqws). У релиза есть `.zip`-ассет с прекомпилированными
+// бинарями под все платформы в `binaries/<платформа>/nfqws`, поэтому достаточно
+// уже подключённого крейта `zip` (без tar/gzip). Версия движка ведётся отдельно от
+// Flowseal-ассетов (`nfqws-version.txt` vs `version.txt`) — у каждого свой релиз.
+
+#[cfg(not(windows))]
+const API_LATEST_NFQWS: &str = "https://api.github.com/repos/bol-van/zapret/releases/latest";
+
+/// Каталог в `binaries/` релиза bol-van под текущую архитектуру.
+#[cfg(not(windows))]
+fn nfqws_platform_dir() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "linux-x86_64",
+        "aarch64" => "linux-arm64",
+        "arm" => "linux-arm",
+        "powerpc" => "linux-ppc",
+        // Прочие (mips*, …) встречаются у роутеров, не у десктопа — фолбэк на x86_64.
+        _ => "linux-x86_64",
+    }
+}
+
+/// Последний релиз bol-van/zapret (движок nfqws). Парс — как у Flowseal: tag_name +
+/// первый `.zip`-ассет.
+#[cfg(not(windows))]
+pub fn check_latest_nfqws(agent: &ureq::Agent) -> Result<LatestRelease, String> {
+    let resp = agent
+        .get(API_LATEST_NFQWS)
+        .set("User-Agent", "Zaprust")
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("запрос к GitHub (bol-van): {e}"))?;
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("чтение ответа GitHub (bol-van): {e}"))?;
+    let tag = json_str(&body, "tag_name").ok_or("в ответе bol-van нет tag_name")?;
+    let zip_url = find_zip_url(&body).ok_or("в релизе bol-van нет .zip-ассета")?;
+    Ok(LatestRelease { tag, zip_url })
+}
+
+/// Достать `nfqws` под текущую архитектуру из релизного zip bol-van в `core/nfqws`
+/// и сделать исполняемым (0755). Ищем запись `…/binaries/<платформа>/nfqws`.
+#[cfg(not(windows))]
+pub fn extract_nfqws(zip_path: &Path, core_dir: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("открыть zip nfqws: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("zip nfqws: {e}"))?;
+
+    let want = format!("binaries/{}/nfqws", nfqws_platform_dir());
+    let mut bytes: Option<Vec<u8>> = None;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        // Имя обычно с префиксом релиза: `zapret-vXX/binaries/linux-x86_64/nfqws`.
+        if name == want || name.ends_with(&format!("/{want}")) {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).map_err(|e| format!("чтение nfqws из zip: {e}"))?;
+            bytes = Some(buf);
+            break;
+        }
+    }
+    let bytes = bytes.ok_or_else(|| format!("в релизе bol-van нет {want}"))?;
+
+    std::fs::create_dir_all(core_dir).map_err(|e| format!("создать {}: {e}", core_dir.display()))?;
+    let dest = core_dir.join("nfqws");
+    std::fs::write(&dest, &bytes).map_err(|e| format!("запись nfqws: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod nfqws: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Локальная версия движка nfqws из `core/nfqws-version.txt` (None — если нет).
+#[cfg(not(windows))]
+pub fn local_nfqws_version(core_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(core_dir.join("nfqws-version.txt"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(windows))]
+pub fn write_nfqws_version(core_dir: &Path, tag: &str) -> Result<(), String> {
+    std::fs::write(core_dir.join("nfqws-version.txt"), tag)
+        .map_err(|e| format!("nfqws-version.txt: {e}"))
+}
+
 // ── Вспомогательное ──────────────────────────────────────────────────────────
 
 /// Извлечь строковое значение поля JSON: "key":"value".
@@ -178,17 +273,34 @@ fn copy_over(src: &Path, dst: &Path) -> Result<(), String> {
         if from.is_dir() {
             copy_over(&from, &to)?;
         } else {
-            let is_user_list = name
-                .to_string_lossy()
-                .to_lowercase()
-                .ends_with("-user.txt");
-            if is_user_list && to.exists() {
+            let lower = name.to_string_lossy().to_lowercase();
+            if lower.ends_with("-user.txt") && to.exists() {
                 continue; // не затираем пользовательские списки
+            }
+            // На Linux выкидываем виндовые артефакты Flowseal: движок и драйвер
+            // платформозависимы (winws.exe, WinDivert*.dll/.sys, cygwin1.dll, *.exe).
+            // Всё прочее (.bat, bin/*.bin, lists/*.txt) работает с nfqws как есть.
+            if is_windows_artifact(&lower) {
+                continue;
             }
             copy_with_retry(&from, &to)?;
         }
     }
     Ok(())
+}
+
+/// Виндовый артефакт сборки Flowseal, который на Linux не нужен (имя в нижнем
+/// регистре). На Windows ничего не выкидываем — там это и есть движок/драйвер.
+#[cfg(windows)]
+fn is_windows_artifact(_lower_name: &str) -> bool {
+    false
+}
+#[cfg(not(windows))]
+fn is_windows_artifact(lower_name: &str) -> bool {
+    lower_name.ends_with(".exe")
+        || lower_name.ends_with(".dll")
+        || lower_name.ends_with(".sys")
+        || lower_name.starts_with("windivert")
 }
 
 /// Копирование с ретраями — на случай ещё не отпущенного файлового лока

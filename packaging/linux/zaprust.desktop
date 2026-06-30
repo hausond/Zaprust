@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Zaprust
+GenericName=DPI bypass
+Comment=GUI для обхода DPI-блокировок (поверх zapret)
+Comment[en]=Lightweight GUI for DPI bypass (zapret)
+Exec=zaprust
+Icon=zaprust
+Terminal=false
+Categories=Network;
+Keywords=dpi;zapret;nfqws;bypass;proxy;
+# Должен совпадать с ViewportBuilder::with_app_id("zaprust") в main.rs, иначе
+# на Wayland окно не сопоставится с этим .desktop и иконка в доке не подхватится.
+StartupWMClass=zaprust

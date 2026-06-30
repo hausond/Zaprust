@@ -4,13 +4,19 @@
 // но никакой системной логики (процессы, файлы, сеть) здесь нет.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Адаптер стратегий Flowseal (.bat) под nfqws — только на Linux (Windows парсит
+// .bat своим путём в platform/windows/strategy.rs).
+#[cfg(not(windows))]
+mod bat;
 mod config;
 mod logging;
-mod service;
+mod platform;
 mod strategies;
 mod updater;
 
-use service::ServiceState;
+// host() возвращает `&dyn Platform`; методы трейтов-слоёв (ServiceController,
+// BypassRuntime, Tester, …) доступны на объекте-трейте без отдельного импорта.
+use platform::{host, ServiceState};
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
@@ -111,7 +117,7 @@ fn main() -> eframe::Result<()> {
     // Логгер + panic-hook — ПЕРВОЙ строкой, до любой логики, чтобы даже
     // мгновенная смерть процесса оставила след. Роль — по подкоманде.
     let role = match cli.get(1).map(|s| s.as_str()) {
-        Some("--svc") | Some("--write-list") => "svc",
+        Some("--svc") | Some("--svc-run") | Some("--write-list") => "svc",
         Some("--autoselect") => "autoselect",
         Some("--apply-update") => "update",
         Some(s) if s.starts_with("--") => "diag",
@@ -137,11 +143,65 @@ fn main() -> eframe::Result<()> {
         test_net();
         return Ok(());
     }
+    // `zaprust --diag` — печать той же диагностики, что и кнопка «Скопировать
+    // диагностику», в консоль (без GUI). Полезно для проверки сборки, в т.ч.
+    // внутри AppImage: показывает $APPIMAGE и цель pkexec-реинвока (L9-засада).
+    if cli.get(1).map(|s| s == "--diag").unwrap_or(false) {
+        for line in host().diag_lines() {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    // `zaprust --install-desktop` — установить/обновить .desktop-entry и иконку
+    // приложения в пользовательских XDG-каталогах (то же, что делается при старте
+    // GUI). Полезно для переустановки иконки в доке/таскбаре без запуска окна.
+    if cli.get(1).map(|s| s == "--install-desktop").unwrap_or(false) {
+        host().integrate_desktop();
+        println!("desktop-интеграция выполнена (см. лог)");
+        return Ok(());
+    }
     // `zaprust --update-dry` — безопасная проверка апдейтера: скачать и применить
     // замену ядра во временную папку (рабочее ядро не трогаем).
     if cli.get(1).map(|s| s == "--update-dry").unwrap_or(false) {
         update_dry();
         return Ok(());
+    }
+    // `zaprust --fetch-core [dir]` — L8-диагностика получения ядра: выполнить тот же
+    // путь, что кнопка «Скачать ядро» (Linux: ассеты Flowseal + движок nfqws bol-van),
+    // без прав и без GUI. Без аргумента ставит в реальную папку ядра; с аргументом —
+    // в указанную (для безопасной проверки, не трогая рабочее ядро).
+    if cli.get(1).map(|s| s == "--fetch-core").unwrap_or(false) {
+        fetch_core_diag(cli.get(2).map(|s| s.as_str()));
+        return Ok(());
+    }
+    // `zaprust --engine-up [стратегия]` — L2 (Linux): ручной foreground-прогон
+    // движка из-под root. Поднимает правила перехвата (nftables/iptables) + nfqws,
+    // держит до Ctrl-C/Enter, затем снимает всё. Доказывает жизнеспособность обхода
+    // до появления pkexec (L4) и systemd-службы (L5). На Windows вернёт ошибку
+    // (там движок работает только службой).
+    if cli.get(1).map(|s| s == "--engine-up").unwrap_or(false) {
+        std::process::exit(engine_up_command(cli.get(2).map(|s| s.as_str())));
+    }
+    // `zaprust --engine-down` — аварийно снять правила перехвата и заглушить nfqws
+    // (если процесс --engine-up убили жёстко и правила повисли).
+    if cli.get(1).map(|s| s == "--engine-down").unwrap_or(false) {
+        std::process::exit(engine_down_command());
+    }
+    // `zaprust --svc-run <стратегия> <gf>` — L5 (Linux): ТЕЛО systemd-службы
+    // (`ExecStart`). Запускается самим systemd от root. Поднимает правила перехвата
+    // + nfqws с выбранной стратегией и держит на переднем плане, пока systemd не
+    // пришлёт SIGTERM, затем снимает всё. На Windows вернёт ошибку (там движок
+    // запускает SCM напрямую через binPath).
+    if cli.get(1).map(|s| s == "--svc-run").unwrap_or(false) {
+        std::process::exit(svc_run_command(cli.get(2).map(|s| s.as_str()), cli.get(3).map(|s| s.as_str())));
+    }
+    // `zaprust --test-elevate [args…]` — L4-диагностика: со стороны GUI вызвать
+    // реальный Elevator (pkexec-диалог), дождаться реинвока от root и прочитать
+    // result-файл обратно. Без args реинвок делает `--svc start` (на Linux пока
+    // упрётся в заглушку systemd → ok=false — это норм, проверяем сам механизм
+    // элевации + хэндшейк, а не успех операции). Это проверка критерия L4.
+    if cli.get(1).map(|s| s == "--test-elevate").unwrap_or(false) {
+        std::process::exit(test_elevate(&cli[2..]));
     }
     // `zaprust --svc <install|remove|start|stop> …` — элевированные операции
     // со службой. Запускается из GUI через ShellExecute runas.
@@ -164,6 +224,12 @@ fn main() -> eframe::Result<()> {
         std::process::exit(write_list_command(&cli[2..]));
     }
 
+    // Зарегистрировать desktop-entry + иконку в системе, чтобы окружение
+    // показывало иконку приложения в доке/таскбаре (на Wayland окно
+    // сопоставляется с .desktop по app_id, см. ниже). Делается ДО создания окна,
+    // идемпотентно и без прав root. На Windows — no-op.
+    host().integrate_desktop();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([484.0, 644.0])
@@ -171,6 +237,11 @@ fn main() -> eframe::Result<()> {
             .with_max_inner_size([484.0, 644.0])
             .with_resizable(false)
             .with_icon(load_window_icon())
+            // app_id фиксируем явно: на Wayland по нему окно сопоставляется с
+            // .desktop-файлом (StartupWMClass=zaprust в AppImage), иначе иконка
+            // в таскбаре/доке не подхватывается. На X11 winit использует его как
+            // WM_CLASS. Значение совпадает с именем .desktop в образе.
+            .with_app_id("zaprust")
             .with_title("Zaprust"),
         ..Default::default()
     };
@@ -182,26 +253,25 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Диагностика: вывести итоговый argv winws для стратегии.
+/// Диагностика: вывести итоговую команду движка для стратегии.
 fn dump_args(name: Option<&str>) {
-    let scan = strategies::scan();
+    let scan = host().scan();
     for m in &scan.messages {
         eprintln!("# {m}");
     }
-    let Some(core_dir) = scan.core_dir.clone() else {
-        return;
-    };
     let target = name.unwrap_or("general");
     match scan.strategies.iter().find(|s| s.name == target) {
-        Some(strat) => {
-            let args = strategies::resolve_game_filter(&strat.args, false);
-            println!("exe:  {}", core_dir.join("bin").join("winws.exe").display());
-            println!("cwd:  {}", core_dir.join("bin").display());
-            println!("argc: {}", args.len());
-            for (i, a) in args.iter().enumerate() {
-                println!("[{i:02}] {a}");
+        Some(strat) => match host().engine_command(strat, false) {
+            Some(cmd) => {
+                println!("exe:  {}", cmd.program.display());
+                println!("cwd:  {}", cmd.cwd.display());
+                println!("argc: {}", cmd.args.len());
+                for (i, a) in cmd.args.iter().enumerate() {
+                    println!("[{i:02}] {a}");
+                }
             }
-        }
+            None => eprintln!("команда движка недоступна (ядро не найдено или не реализовано)"),
+        },
         None => {
             eprintln!("стратегия не найдена: {target}");
             for s in &scan.strategies {
@@ -214,7 +284,7 @@ fn dump_args(name: Option<&str>) {
 /// Диагностика апдейтера: скачать последний релиз и применить замену во
 /// временную папку (не трогая рабочее ядро), проверить результат.
 fn update_dry() {
-    let agent = build_agent();
+    let agent = host().agent();
     let latest = match updater::check_latest(&agent) {
         Ok(l) => l,
         Err(e) => {
@@ -227,7 +297,8 @@ fn update_dry() {
 
     let zip = std::env::temp_dir().join("zaprust_diag.zip");
     print!("скачиваю… ");
-    if let Err(e) = updater::download(&agent, &latest.zip_url, &zip, |_, _| {}) {
+    let dl = host().download_agent();
+    if let Err(e) = updater::download(&dl, &latest.zip_url, &zip, |_, _| {}) {
         println!("download: {e}");
         return;
     }
@@ -268,12 +339,58 @@ fn update_dry() {
     }
 }
 
-/// Диагностика: детект WinDivert + прогон теста доменов в консоль.
-fn test_net() {
-    println!("WinDivert: {:?}", service::query("WinDivert"));
-    println!("Служба zapret: {:?}", service::query(service::SERVICE_NAME));
+/// L8-диагностика: выполнить получение ядра (как кнопка «Скачать ядро») без GUI.
+/// На Linux проверяет оба источника (Flowseal + nfqws). `dir` — куда ставить
+/// (по умолчанию реальная папка ядра).
+fn fetch_core_diag(dir: Option<&str>) {
+    let target = dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| host().preferred_core_dir());
+    println!("ставлю ядро в: {}", target.display());
 
-    let scan = strategies::scan();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let printer = std::thread::spawn(move || {
+        while let Ok(line) = rx.recv() {
+            println!("  {line}");
+        }
+    });
+    let result = download_core_impl(&target, &tx);
+    drop(tx);
+    let _ = printer.join();
+
+    match result {
+        Ok(msg) => {
+            println!("итог: {msg}");
+            println!("проверка раскладки core/:");
+            println!("  nfqws:        {}", target.join("nfqws").is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let exec = std::fs::metadata(target.join("nfqws"))
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false);
+                println!("  nfqws +x:     {exec}");
+            }
+            let bats = std::fs::read_dir(&target)
+                .map(|r| r.flatten().filter(|e| e.path().extension().map(|x| x == "bat").unwrap_or(false)).count())
+                .unwrap_or(0);
+            println!("  *.bat в корне: {bats}");
+            println!("  bin/*.bin:    {}", target.join("bin").is_dir());
+            println!("  winws.exe выкинут: {}", !target.join("bin").join("winws.exe").exists());
+            println!("  version.txt:       {:?}", updater::local_version(&target));
+            #[cfg(not(windows))]
+            println!("  nfqws-version.txt: {:?}", updater::local_nfqws_version(&target));
+        }
+        Err(e) => println!("ошибка: {e}"),
+    }
+}
+
+/// Диагностика: состояние службы + прогон теста доменов в консоль.
+fn test_net() {
+    println!("Служба обхода: {:?}", host().state());
+    println!("Движок: {:?}", host().engine_alive());
+
+    let scan = host().scan();
     let targets: Vec<Probe> = scan
         .core_dir
         .as_ref()
@@ -289,7 +406,7 @@ fn test_net() {
         });
 
     println!("целей: {}", targets.len());
-    let agent = build_agent();
+    let agent = host().agent();
     let mut ok = 0;
     for p in &targets {
         let res = p.check(&agent);
@@ -301,42 +418,38 @@ fn test_net() {
     println!("итог: {ok}/{} доступно", targets.len());
 }
 
-/// Диагностика: спавн winws со стратегией, ожидание ~4с, печать его вывода.
+/// Диагностика: спавн движка со стратегией, ожидание ~4с, печать его вывода.
 fn test_run(name: Option<&str>) {
-    let scan = strategies::scan();
-    let Some(core_dir) = scan.core_dir.clone() else {
-        eprintln!("ядро не найдено");
-        return;
-    };
+    let scan = host().scan();
     let target = name.unwrap_or("general");
     let Some(strat) = scan.strategies.iter().find(|s| s.name == target) else {
         eprintln!("стратегия не найдена: {target}");
         return;
     };
+    let Some(cmd_spec) = host().engine_command(strat, false) else {
+        eprintln!("команда движка недоступна (ядро не найдено или не реализовано)");
+        return;
+    };
 
-    let bin_dir = core_dir.join("bin");
-    let exe = bin_dir.join("winws.exe");
-    let args = strategies::resolve_game_filter(&strat.args, false);
-
-    let log_path = std::env::temp_dir().join("zaprust_winws_test.log");
+    let log_path = std::env::temp_dir().join("zaprust_engine_test.log");
     let file = std::fs::File::create(&log_path).expect("create log");
     let err = file.try_clone().map(Stdio::from).unwrap_or_else(|_| Stdio::null());
 
-    let mut cmd = Command::new(&exe);
-    cmd.args(&args)
-        .current_dir(&bin_dir)
+    let mut cmd = Command::new(&cmd_spec.program);
+    cmd.args(&cmd_spec.args)
+        .current_dir(&cmd_spec.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(err);
 
-    println!("spawn: {} ({} args)", exe.display(), args.len());
+    println!("spawn: {} ({} args)", cmd_spec.program.display(), cmd_spec.args.len());
     match cmd.spawn() {
         Ok(mut child) => {
             std::thread::sleep(Duration::from_secs(4));
             match child.try_wait() {
-                Ok(Some(status)) => println!("winws завершился сам, код {:?}", status.code()),
+                Ok(Some(status)) => println!("движок завершился сам, код {:?}", status.code()),
                 Ok(None) => {
-                    println!("winws ещё жив через 4с — глушу");
+                    println!("движок ещё жив через 4с — глушу");
                     let _ = child.kill();
                     let _ = child.wait();
                 }
@@ -346,10 +459,143 @@ fn test_run(name: Option<&str>) {
         Err(e) => println!("spawn error: {e}"),
     }
 
-    println!("---- вывод winws ({}) ----", log_path.display());
+    println!("---- вывод движка ({}) ----", log_path.display());
     match std::fs::read(&log_path) {
         Ok(bytes) => println!("{}", String::from_utf8_lossy(&bytes)),
         Err(e) => println!("не прочитать лог: {e}"),
+    }
+}
+
+/// L2 (Linux): ручной запуск движка из-под root. Поднимает правила перехвата +
+/// nfqws с выбранной (по умолчанию — единственной хардкод) стратегией, держит до
+/// Ctrl-C/Enter, затем всё снимает. Это и есть проверка критерия L2.
+fn engine_up_command(name: Option<&str>) -> i32 {
+    if !host().is_elevated() {
+        eprintln!("Ошибка: --engine-up требует root. Запустите через sudo.");
+        return 1;
+    }
+    if !host().engine_installed() {
+        eprintln!("Движок не найден: {}", host().engine_diag());
+        eprintln!("Установите bol-van/zapret (бинарь nfqws) — автоустановку даст L8.");
+        return 1;
+    }
+
+    let scan = host().scan();
+    for m in &scan.messages {
+        eprintln!("# {m}");
+    }
+    let strat = match name {
+        Some(n) => scan.strategies.iter().find(|s| s.name == n),
+        None => scan.strategies.first(),
+    };
+    let Some(strat) = strat else {
+        match name {
+            Some(n) => eprintln!("Стратегия не найдена: {n}"),
+            None => eprintln!("Стратегий нет"),
+        }
+        return 1;
+    };
+
+    println!("Движок: {}", host().engine_diag());
+    match host().run_foreground(strat, false) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Ошибка: {e}");
+            1
+        }
+    }
+}
+
+/// `--engine-down`: аварийно снять правила перехвата и заглушить nfqws.
+fn engine_down_command() -> i32 {
+    if !host().is_elevated() {
+        eprintln!("Ошибка: --engine-down требует root. Запустите через sudo.");
+        return 1;
+    }
+    host().reset_engine();
+    println!("Готово: nfqws заглушён, правила перехвата сняты (best-effort).");
+    0
+}
+
+/// L5: тело systemd-службы (`ExecStart=… --svc-run <стратегия> <gf>`). Запускается
+/// самим systemd от root: поднимает правила перехвата + nfqws и держит на переднем
+/// плане до SIGTERM (Стоп службы), затем снимает всё. Вывод движка идёт в journald.
+fn svc_run_command(name: Option<&str>, gf: Option<&str>) -> i32 {
+    if !host().is_elevated() {
+        eprintln!("Ошибка: --svc-run запускается systemd от root.");
+        return 1;
+    }
+    let game_filter = gf == Some("1");
+    let scan = host().scan();
+    for m in &scan.messages {
+        logging::info("service", m);
+    }
+    let strat = match name {
+        Some(n) => scan.strategies.iter().find(|s| s.name == n),
+        None => scan.strategies.first(),
+    };
+    let Some(strat) = strat else {
+        let msg = match name {
+            Some(n) => format!("стратегия не найдена: {n}"),
+            None => "стратегий нет".to_owned(),
+        };
+        logging::error("service", &msg);
+        eprintln!("Ошибка: {msg}");
+        return 1;
+    };
+    logging::info("service", format!("движок: {}", host().engine_diag()));
+    match host().run_service(strat, game_filter) {
+        Ok(()) => 0,
+        Err(e) => {
+            logging::error("service", format!("служба: {e}"));
+            eprintln!("Ошибка: {e}");
+            1
+        }
+    }
+}
+
+/// L4-диагностика: проверка критерия элевации. Со стороны НЕэлевированного GUI
+/// зовём `run_elevated_self` (→ pkexec покажет один polkit-диалог), реинвок
+/// исполняется от root, пишет result-файл в /tmp, а мы читаем его обратно.
+fn test_elevate(args: &[String]) -> i32 {
+    if host().is_elevated() {
+        eprintln!("Запускайте БЕЗ sudo/root — смысл теста в том, чтобы pkexec поднял права сам.");
+        return 2;
+    }
+    // По умолчанию реинвок делает `--svc start` (на Linux пока заглушка systemd).
+    let argv: Vec<&str> = if args.is_empty() {
+        vec!["--svc", "start"]
+    } else {
+        args.iter().map(|s| s.as_str()).collect()
+    };
+
+    println!("вызываю элевацию: {} (сейчас должен появиться polkit-диалог)…", argv.join(" "));
+    let _ = std::fs::remove_file(op_result_path());
+
+    match host().run_elevated_self(&argv) {
+        Ok(code) => {
+            println!("реинвок завершён, код выхода = {code}");
+            match read_op_result() {
+                Some(r) => {
+                    println!(
+                        "result-файл получен: op={} ok={} service_state={} winws_pid={:?} error={:?}",
+                        r.op, r.ok, r.service_state, r.winws_pid, r.error
+                    );
+                    println!("✔ КРИТЕРИЙ L4: один диалог → реинвок от root → результат дошёл до GUI через файл.");
+                    0
+                }
+                None => {
+                    println!("⚠ код выхода есть, но result-файла нет (реинвок не дописал итог).");
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            // Отмена диалога (rc=126), pkexec недоступен, смерть по сигналу — всё сюда.
+            println!("элевация не выполнена: {e}");
+            println!("(отмена диалога = rc=126; это корректный, различимый исход — UI не виснет.)");
+            1
+        }
     }
 }
 
@@ -378,6 +624,10 @@ struct ZaprustApp {
     service_busy: Arc<AtomicBool>,
     /// Последняя операция отчиталась ok, но обход по факту не поднялся (рассинхрон).
     op_failed: Arc<AtomicBool>,
+    /// Живой рассинхрон: служба «active», но tri-check движка не подтверждает обход
+    /// (nfqws мёртв / правил нет). Ставится периодической проверкой — чтобы статус
+    /// не врал «Работает» при тихо умершем движке.
+    status_desync: Arc<AtomicBool>,
     /// Идёт ли проверка/установка/скачивание ядра.
     update_busy: Arc<AtomicBool>,
     /// Фоновый поток просит переcканировать ядро (после загрузки/обновления).
@@ -429,8 +679,8 @@ impl ZaprustApp {
         cc.egui_ctx.set_zoom_factor(1.15);
         let icons = Icons::load(&cc.egui_ctx);
 
-        // Сканируем ядро при старте (чисто файловая, синхронная операция).
-        let core = strategies::scan();
+        // Сканируем ядро при старте (источник стратегий платформы).
+        let core = host().scan();
         let mut log_lines: Vec<String> = core.messages.iter().cloned().collect();
         log_lines.push("zaprust: интерфейс запущен".to_owned());
 
@@ -438,7 +688,7 @@ impl ZaprustApp {
         let cfg = config::Config::load();
 
         // Синхронно узнаём состояние службы и её стратегию (быстро, один раз).
-        let service0 = service::query(service::SERVICE_NAME);
+        let service0 = host().state();
 
         // Режим smart выбран, если в конфиге спец-значение.
         let smart_selected = cfg.strategy.as_deref() == Some(config::SMART);
@@ -446,7 +696,7 @@ impl ZaprustApp {
         // Last-known-good победитель: из конфига, иначе — из метки активной службы.
         let auto_best = cfg.auto_best.clone().or_else(|| {
             if service0.installed() {
-                service::installed_strategy()
+                host().installed_strategy()
             } else {
                 None
             }
@@ -455,7 +705,7 @@ impl ZaprustApp {
         // Восстанавливаем выбранную РЕАЛЬНУЮ стратегию по имени (если не smart):
         // приоритет — реально запущенная служба, затем конфиг.
         let pick_name = if service0.installed() {
-            service::installed_strategy()
+            host().installed_strategy()
         } else {
             cfg.strategy.clone().filter(|s| s != config::SMART)
         };
@@ -475,8 +725,9 @@ impl ZaprustApp {
         let (service_tx, service_rx) = std::sync::mpsc::channel();
         let (lists_tx, lists_rx) = std::sync::mpsc::channel();
 
-        // Поддерживаем состояние службы свежим.
-        check_service(service_tx.clone());
+        // Поддерживаем состояние службы свежим (вместе с tri-check рассинхрона).
+        let status_desync = Arc::new(AtomicBool::new(false));
+        check_service(service_tx.clone(), status_desync.clone());
 
         Self {
             icons,
@@ -494,6 +745,7 @@ impl ZaprustApp {
             test_running: Arc::new(AtomicBool::new(false)),
             service_busy: Arc::new(AtomicBool::new(false)),
             op_failed: Arc::new(AtomicBool::new(false)),
+            status_desync,
             update_busy: Arc::new(AtomicBool::new(false)),
             reload_requested: Arc::new(AtomicBool::new(false)),
             simple_mode: cfg.simple_mode,
@@ -532,26 +784,24 @@ impl ZaprustApp {
     }
 
 
-    /// Готово ли ядро к работе: версия + ключевые файлы + распарсенные стратегии.
+    /// Готово ли ядро к работе: версия + установленный движок + распарсенные стратегии.
     fn core_ready(&self) -> bool {
         let Some(dir) = &self.core.core_dir else {
             return false;
         };
         !self.core.strategies.is_empty()
             && updater::local_version(dir).is_some()
-            && dir.join("bin").join("winws.exe").exists()
-            && dir.join("bin").join("WinDivert.dll").exists()
-            && dir.join("bin").join("WinDivert64.sys").exists()
+            && host().engine_installed()
     }
 
     /// Пересканировать ядро (после загрузки/обновления/подбора).
     fn reload_core(&mut self) {
-        self.core = strategies::scan();
+        self.core = host().scan();
         if self.selected_strategy >= self.core.strategies.len() {
             self.selected_strategy = 0;
         }
         // Если служба установлена — подставить её стратегию (победителя подбора).
-        if let Some(name) = service::installed_strategy() {
+        if let Some(name) = host().installed_strategy() {
             if let Some(idx) = self.core.strategies.iter().position(|s| s.name == name) {
                 self.selected_strategy = idx;
                 self.save_config();
@@ -571,7 +821,7 @@ impl ZaprustApp {
             .core
             .core_dir
             .clone()
-            .unwrap_or_else(strategies::preferred_core_dir);
+            .unwrap_or_else(|| host().preferred_core_dir());
         let log_tx = self.log_tx.clone();
         let busy = self.update_busy.clone();
         let reload = self.reload_requested.clone();
@@ -611,7 +861,7 @@ impl ZaprustApp {
                     let _ = log_tx.send(format!("обновление: {e}"));
                 }
             }
-            let _ = svc_tx.send(service::query(service::SERVICE_NAME));
+            let _ = svc_tx.send(host().state());
             busy.store(false, Ordering::SeqCst);
         });
     }
@@ -627,7 +877,7 @@ impl ZaprustApp {
         self.log(format!("тест: проверяю {} целей…", targets.len()));
 
         std::thread::spawn(move || {
-            let agent = build_agent();
+            let agent = host().agent();
             let mut ok_count = 0usize;
             for probe in &targets {
                 let ok = probe.check(&agent);
@@ -678,10 +928,10 @@ impl ZaprustApp {
         self.core.strategies.get(self.selected_strategy)
     }
 
-    /// Запущен ли обход (есть живой процесс winws).
-    /// Обход активен = служба запущена.
+    /// Запущен ли обход. Служба «active» И tri-check без рассинхрона: при тихо
+    /// умершем движке (служба active, nfqws мёртв) НЕ показываем «Работает».
     fn is_running(&self) -> bool {
-        self.service == ServiceState::Running
+        self.service == ServiceState::Running && !self.status_desync.load(Ordering::Relaxed)
     }
 
     fn log(&mut self, msg: impl Into<String>) {
@@ -753,7 +1003,7 @@ impl ZaprustApp {
         let running = self.autoselect_running.clone();
 
         std::thread::spawn(move || {
-            let res = run_elevated_self(&["--autoselect", gf, &lkg]);
+            let res = host().run_elevated_self(&["--autoselect", gf, &lkg]);
             match res {
                 Ok(0) => {
                     let _ = log_tx.send("автоподбор: победитель установлен".to_owned());
@@ -775,7 +1025,7 @@ impl ZaprustApp {
                     let _ = log_tx.send(format!("автоподбор: {e}"));
                 }
             }
-            let _ = svc_tx.send(service::query(service::SERVICE_NAME));
+            let _ = svc_tx.send(host().state());
             running.store(false, Ordering::SeqCst);
         });
     }
@@ -890,7 +1140,7 @@ impl ZaprustApp {
         let busy = self.lists_busy.clone();
         self.lists_status = "откат: скачиваю стандартный…".to_owned();
         std::thread::spawn(move || {
-            let agent = build_agent();
+            let agent = host().agent();
             match updater::fetch_default_list(&agent, &name) {
                 Ok(bytes) => match write_list_with_fallback(&path, &bytes) {
                     Ok(()) => {
@@ -915,7 +1165,7 @@ impl ZaprustApp {
     fn open_logs_folder(&mut self) {
         match logging::log_dir() {
             Some(dir) => {
-                open_in_explorer(&dir);
+                host().open_path(&dir);
                 self.log(format!("логи: {}", dir.display()));
             }
             None => self.log("папка логов не определена"),
@@ -923,7 +1173,7 @@ impl ZaprustApp {
     }
 
     fn copy_diagnostics(&mut self) {
-        if set_clipboard(&diagnostics_text()) {
+        if host().set_clipboard(&diagnostics_text()) {
             self.log("диагностика скопирована в буфер обмена");
         } else {
             self.log("не удалось скопировать диагностику");
@@ -987,7 +1237,7 @@ impl ZaprustApp {
 
         std::thread::spawn(move || {
             let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            let code = run_elevated_self(&argv);
+            let code = host().run_elevated_self(&argv);
             match &code {
                 Ok(0) => {
                     let _ = log_tx.send(format!("{what}: готово"));
@@ -1009,18 +1259,18 @@ impl ZaprustApp {
                 }
             }
 
-            // Авторитетный поллинг ~5с (учитываем START_PENDING и квирк winws-как-службы).
+            // Авторитетный поллинг ~5с (учитываем START_PENDING и квирк движка-как-службы).
             let mut authoritative = false;
             for _ in 0..16 {
-                let st = service::query(service::SERVICE_NAME);
+                let st = host().state();
                 let _ = svc_tx.send(st);
-                authoritative = authoritative_running();
+                authoritative = host().authoritative_running();
                 if expect_running && authoritative {
                     break;
                 }
                 if expect_removed
                     && st == ServiceState::NotInstalled
-                    && service::winws_alive().is_none()
+                    && host().engine_alive().is_none()
                 {
                     break;
                 }
@@ -1029,17 +1279,17 @@ impl ZaprustApp {
 
             // Реинвок отчитался ok, но обход не поднялся → явная ошибка состояния.
             if matches!(code, Ok(0)) && expect_running && !authoritative {
-                let st = service::query(service::SERVICE_NAME);
-                let winws = service::winws_alive();
+                let st = host().state();
+                let engine = host().engine_alive();
                 let msg = format!(
-                    "обход НЕ поднялся: служба={st:?}, winws_pid={winws:?}. Подробности в логах."
+                    "обход НЕ поднялся: служба={st:?}, движок_pid={engine:?}. Подробности в логах."
                 );
                 logging::error("gui", &msg);
                 let _ = log_tx.send(format!("ОШИБКА: {msg}"));
                 op_failed.store(true, Ordering::SeqCst);
             }
 
-            let _ = svc_tx.send(service::query(service::SERVICE_NAME));
+            let _ = svc_tx.send(host().state());
             busy.store(false, Ordering::SeqCst);
         });
     }
@@ -1066,12 +1316,12 @@ impl eframe::App for ZaprustApp {
         }
         if self.last_status_check.elapsed() >= Duration::from_secs(3) {
             self.last_status_check = Instant::now();
-            check_service(self.service_tx.clone());
+            check_service(self.service_tx.clone(), self.status_desync.clone());
         }
 
         // Автоподбор успешно завершился — запомнить победителя в auto_best.
         if self.autoselect_applied.swap(false, Ordering::SeqCst) {
-            if let Some(name) = service::installed_strategy() {
+            if let Some(name) = host().installed_strategy() {
                 self.auto_best = Some(name);
                 self.save_config();
             }
@@ -1135,7 +1385,11 @@ impl ZaprustApp {
             ui.label(RichText::new("Zaprust").size(20.0).strong().color(Color32::WHITE));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if self.op_failed.load(Ordering::Relaxed) {
+                if self.op_failed.load(Ordering::Relaxed)
+                    || self.status_desync.load(Ordering::Relaxed)
+                {
+                    // Рассинхрон tri-check (служба active, но движок мёртв) — честная
+                    // «Ошибка», а не тихий «Выключен»/«Работает».
                     pill(ui, "Ошибка", DANGER);
                 } else if self.is_running() {
                     pill(ui, "Работает", OK);
@@ -1744,18 +1998,23 @@ fn dot(ui: &mut egui::Ui, color: Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
-// ── Проверки состояния служб (WinDivert / zapret) ────────────────────────────
+// ── Проверки состояния службы обхода ─────────────────────────────────────────
 
-/// Фоновая проверка состояния службы/драйвера по имени → канал.
-fn check_state(name: &'static str, tx: Sender<ServiceState>) {
+/// Фоновая проверка состояния службы обхода → канал.
+/// Фоновая периодическая проверка состояния: состояние юнита + авторитетный
+/// tri-check. `status_desync` ставится, если служба «active», а обход по факту не
+/// поднят (живой рассинхрон: nfqws мёртв / правил нет) — чтобы UI показал «Ошибка»,
+/// а не тихо врал «Работает». Сетевые/процессные вызовы — в отдельном потоке, UI не
+/// блокируем.
+fn check_service(tx: Sender<ServiceState>, status_desync: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let _ = tx.send(service::query(name));
+        let state = host().state();
+        // Рассинхрон только когда служба считается запущенной: «active», но
+        // authoritative_running() (служба И движок И правила) не подтверждает.
+        let desync = state == ServiceState::Running && !host().authoritative_running();
+        status_desync.store(desync, Ordering::SeqCst);
+        let _ = tx.send(state);
     });
-}
-
-/// Фоновая проверка состояния службы zapret → канал.
-fn check_service(tx: Sender<ServiceState>) {
-    check_state(service::SERVICE_NAME, tx);
 }
 
 // ── Тест доступности доменов ─────────────────────────────────────────────────
@@ -1843,34 +2102,11 @@ impl Probe {
     }
 }
 
-/// HTTP-агент с TLS Windows (SChannel). connect/overall — таймауты в мс,
-/// redirects — число редиректов (0 для замеров пинга, чтобы один round-trip).
-fn build_agent_with(connect_ms: u64, overall_ms: u64, redirects: u32) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(connect_ms))
-        .timeout(Duration::from_millis(overall_ms))
-        .redirects(redirects);
-    if let Ok(connector) = native_tls::TlsConnector::new() {
-        builder = builder.tls_connector(Arc::new(connector));
-    }
-    builder.build()
-}
-
-/// Агент для кнопки «Тест» (умеренные таймауты, следует редиректам).
-fn build_agent() -> ureq::Agent {
-    build_agent_with(3000, 4000, 5)
-}
-
-/// Агент для автоподбора: тугие таймауты, без редиректов (чистый замер).
-fn build_probe_agent() -> ureq::Agent {
-    build_agent_with(1500, 1800, 0)
-}
-
 // ── Элевированные операции со службой ────────────────────────────────────────
 
 /// Путь к файлу-логу элевированных операций (для возврата сообщений в GUI).
 fn svc_log_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("zaprust_svc.log")
+    handshake_dir().join("zaprust_svc.log")
 }
 
 fn write_svc_log(msg: &str) {
@@ -1894,23 +2130,19 @@ fn read_svc_log() -> Vec<String> {
 fn run_service_command(args: &[String]) -> i32 {
     let _ = std::fs::remove_file(svc_log_path()); // чистим прошлые сообщения
     let action = args.first().map(|s| s.as_str()).unwrap_or("");
-    logging::info("svc", format!("операция службы: {action} (elevated={})", is_elevated()));
+    logging::info("svc", format!("операция службы: {action} (elevated={})", host().is_elevated()));
 
     let result: Result<(), String> = match action {
         "install" => {
             let name = args.get(1).map(|s| s.as_str()).unwrap_or("");
             let gf = args.get(2).map(|s| s == "1").unwrap_or(false);
             logging::info("svc", format!("install стратегии: {name}, game_filter={gf}"));
-            install_service_elevated(name, gf)
+            host().install(name, gf)
         }
-        "remove" => service::remove(),
-        "start" => service::start(),
-        "stop" => service::stop(),
-        "uninstall" => {
-            let _ = service::remove(); // удалить службу (если есть)
-            service::stop_driver(); // выгрузить WinDivert/WinDivert14
-            Ok(())
-        }
+        "remove" => host().remove(),
+        "start" => host().start(),
+        "stop" => host().stop(),
+        "uninstall" => host().uninstall(),
         other => Err(format!("неизвестная операция службы: {other}")),
     };
 
@@ -1929,72 +2161,140 @@ fn run_service_command(args: &[String]) -> i32 {
     }
 }
 
-/// Сборка аргументов выбранной стратегии и установка службы (под админом).
-fn install_service_elevated(strategy_name: &str, game_filter: bool) -> Result<(), String> {
-    let scan = strategies::scan();
-    let core_dir = scan.core_dir.ok_or_else(|| "ядро не найдено".to_owned())?;
-    let strategy = scan
-        .strategies
-        .iter()
-        .find(|s| s.name == strategy_name)
-        .ok_or_else(|| format!("стратегия не найдена: {strategy_name}"))?;
-
-    let exe = core_dir.join("bin").join("winws.exe");
-    if !exe.exists() {
-        return Err(format!("не найден {}", exe.display()));
-    }
-    let args = strategies::resolve_game_filter(&strategy.args, game_filter);
-    ensure_user_lists(&args);
-
-    // Сбрасываем драйвер WinDivert перед установкой: прошлый winws (упавший/убитый,
-    // в т.ч. после неудачного автоподбора) мог оставить драйвер занятым — тогда
-    // winws службы стартует и сразу падает (код 1), служба остаётся Stopped.
-    logging::info("svc", "сброс драйвера WinDivert перед установкой службы");
-    service::stop_driver();
-    std::thread::sleep(Duration::from_millis(800));
-
-    let res = service::install(&exe, &args, strategy_name);
-
-    // Если служба установилась, но winws не поднялся — снимаем собственный вывод
-    // winws (запуск напрямую, с захватом stdout/stderr), чтобы увидеть причину.
-    if res.is_ok() && service::winws_alive().is_none() {
-        logging::error("svc", "служба установлена, но winws не запущен — диагностический прогон winws");
-        match spawn_winws(&core_dir, &args) {
-            Ok(mut c) => {
-                std::thread::sleep(Duration::from_millis(2000));
-                let early = c.try_wait().ok().flatten();
-                let _ = c.kill();
-                let _ = c.wait();
-                let out = winws_last_output();
-                logging::error(
-                    "svc",
-                    format!(
-                        "диагностика winws: {}{}",
-                        match early {
-                            Some(st) => format!("вышел код {:?}", st.code()),
-                            None => "остался жив при прямом запуске (проблема в режиме службы)".to_owned(),
-                        },
-                        if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
-                    ),
-                );
-            }
-            Err(e) => logging::error("svc", format!("диагностика: winws не запустился: {e}")),
-        }
-    }
-
-    res
-}
-
-/// GUI-сторона обновления (без прав): проверка → скачивание → элевированная замена.
-/// Возвращает короткое сообщение об итоге.
+/// GUI-сторона обновления (без прав): проверка → скачивание → замена. На Windows —
+/// один источник Flowseal с элевированной заменой. На Linux — два источника
+/// (Flowseal + nfqws), элевация только если служба установлена.
 fn run_update(
     core_dir: Option<std::path::PathBuf>,
     strategy: Option<String>,
     game_filter: bool,
     log_tx: &Sender<String>,
 ) -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        run_update_linux(core_dir, strategy, game_filter, log_tx)
+    }
+    #[cfg(windows)]
+    {
+        run_update_windows(core_dir, strategy, game_filter, log_tx)
+    }
+}
+
+/// Linux: проверить обе версии (Flowseal + nfqws), скачать изменившееся без прав,
+/// затем применить. Если служба установлена — заменить в ОДНОМ элевированном
+/// реинвоке (стоп демона → замена под root → chown обратно → перезапуск); иначе
+/// записать прямо как пользователь, без диалога.
+#[cfg(not(windows))]
+fn run_update_linux(
+    core_dir: Option<std::path::PathBuf>,
+    strategy: Option<String>,
+    game_filter: bool,
+    log_tx: &Sender<String>,
+) -> Result<String, String> {
     let core_dir = core_dir.ok_or_else(|| "ядро не найдено".to_owned())?;
-    let agent = build_agent();
+    let agent = host().agent();
+
+    let _ = log_tx.send("обновление: проверяю релизы Flowseal и bol-van…".to_owned());
+    let fs = updater::check_latest(&agent)?;
+    let bv = updater::check_latest_nfqws(&agent)?;
+    let fs_local = updater::local_version(&core_dir);
+    let bv_local = updater::local_nfqws_version(&core_dir);
+    let fs_upd = fs_local.as_deref() != Some(fs.tag.as_str());
+    let bv_upd = bv_local.as_deref() != Some(bv.tag.as_str());
+
+    if !fs_upd && !bv_upd {
+        return Ok(format!("уже актуально (Flowseal {}, nfqws {})", fs.tag, bv.tag));
+    }
+    if fs_upd {
+        let _ = log_tx.send(format!(
+            "обновление: Flowseal {} (текущая: {})",
+            fs.tag,
+            fs_local.as_deref().unwrap_or("неизвестна")
+        ));
+    }
+    if bv_upd {
+        let _ = log_tx.send(format!(
+            "обновление: nfqws {} (текущая: {})",
+            bv.tag,
+            bv_local.as_deref().unwrap_or("неизвестна")
+        ));
+    }
+
+    // Скачиваем нужное (запись в /tmp прав не требует).
+    let dl = host().download_agent();
+    let fs_zip = std::env::temp_dir().join("zaprust_flowseal_upd.zip");
+    let bv_zip = std::env::temp_dir().join("zaprust_nfqws_upd.zip");
+    if fs_upd {
+        download_with_progress(&dl, &fs.zip_url, &fs_zip, log_tx, "обновление (Flowseal)")?;
+    }
+    if bv_upd {
+        download_with_progress(&dl, &bv.zip_url, &bv_zip, log_tx, "обновление (nfqws)")?;
+    }
+
+    let done_msg = || {
+        let mut parts = Vec::new();
+        if fs_upd {
+            parts.push(format!("Flowseal {}", fs.tag));
+        }
+        if bv_upd {
+            parts.push(format!("nfqws {}", bv.tag));
+        }
+        format!("обновлено: {}", parts.join(" + "))
+    };
+
+    // Служба не установлена → применяем как пользователь, без polkit-диалога.
+    if !host().state().installed() {
+        if fs_upd {
+            updater::apply(&core_dir, &fs_zip)?;
+            updater::write_version(&core_dir, &fs.tag)?;
+        }
+        if bv_upd {
+            updater::extract_nfqws(&bv_zip, &core_dir)?;
+            updater::write_nfqws_version(&core_dir, &bv.tag)?;
+        }
+        let _ = std::fs::remove_file(&fs_zip);
+        let _ = std::fs::remove_file(&bv_zip);
+        return Ok(done_msg());
+    }
+
+    // Служба установлена → один элевированный реинвок: стоп демона/правил →
+    // замена ядра под root → chown файлов обратно пользователю → перезапуск службы
+    // на той же стратегии. «-» в позиции zip = этот источник не обновляем.
+    let _ = log_tx.send("обновление: останавливаю службу и заменяю ядро (pkexec)…".to_owned());
+    let fs_arg = if fs_upd { fs_zip.to_string_lossy().to_string() } else { "-".to_owned() };
+    let bv_arg = if bv_upd { bv_zip.to_string_lossy().to_string() } else { "-".to_owned() };
+    let gf = if game_filter { "1" } else { "0" };
+    let mut argv: Vec<&str> = vec!["--apply-update", &fs_arg, &fs.tag, &bv_arg, &bv.tag];
+    if let Some(name) = &strategy {
+        argv.push(name);
+        argv.push(gf);
+    }
+
+    let result = match host().run_elevated_self(&argv) {
+        Ok(0) => Ok(done_msg()),
+        Ok(code) => {
+            for line in read_svc_log() {
+                let _ = log_tx.send(format!("обновление: {line}"));
+            }
+            Err(format!("установка не удалась (код {code})"))
+        }
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_file(&fs_zip);
+    let _ = std::fs::remove_file(&bv_zip);
+    result
+}
+
+/// Windows: проверка → скачивание → элевированная замена (один релиз Flowseal).
+#[cfg(windows)]
+fn run_update_windows(
+    core_dir: Option<std::path::PathBuf>,
+    strategy: Option<String>,
+    game_filter: bool,
+    log_tx: &Sender<String>,
+) -> Result<String, String> {
+    let core_dir = core_dir.ok_or_else(|| "ядро не найдено".to_owned())?;
+    let agent = host().agent();
 
     let _ = log_tx.send("обновление: проверяю последний релиз Flowseal…".to_owned());
     let latest = updater::check_latest(&agent)?;
@@ -2011,8 +2311,9 @@ fn run_update(
 
     let zip_path = std::env::temp_dir().join("zaprust_core_update.zip");
     let _ = log_tx.send("обновление: скачиваю ядро…".to_owned());
+    let dl = host().download_agent();
     let mut last_pct: u64 = 0;
-    updater::download(&agent, &latest.zip_url, &zip_path, |done, total| {
+    updater::download(&dl, &latest.zip_url, &zip_path, |done, total| {
         if let Some(t) = total.filter(|t| *t > 0) {
             let pct = done * 100 / t;
             if pct >= last_pct + 20 {
@@ -2031,7 +2332,7 @@ fn run_update(
         argv.push(gf);
     }
 
-    match run_elevated_self(&argv) {
+    match host().run_elevated_self(&argv) {
         Ok(0) => Ok(format!("обновлено до {}", latest.tag)),
         Ok(code) => {
             for line in read_svc_log() {
@@ -2043,17 +2344,95 @@ fn run_update(
     }
 }
 
-/// Первая установка ядра: скачать последний релиз и распаковать в target.
-/// Пытаемся без прав; если папка непишемая (Program Files) — через элевацию.
+/// Первая установка ядра. На Windows — один релиз Flowseal (винда-движок внутри).
+/// На Linux — ДВА источника (ассеты Flowseal + движок nfqws bol-van), запись в
+/// пользовательский XDG-каталог прав не требует (элевация нужна только службе).
 fn download_core_impl(target: &std::path::Path, log_tx: &Sender<String>) -> Result<String, String> {
-    let agent = build_agent();
+    #[cfg(not(windows))]
+    {
+        download_core_linux(target, log_tx)
+    }
+    #[cfg(windows)]
+    {
+        download_core_windows(target, log_tx)
+    }
+}
+
+/// Linux: получить ядро из ДВУХ источников без элевации.
+///   1) ассеты Flowseal (стратегии `.bat` + `bin/*.bin` + `lists/*.txt`), виндовые
+///      файлы (winws.exe/WinDivert*/cygwin1.dll/*.exe) выкидываются при распаковке;
+///   2) движок `nfqws` из релиза bol-van/zapret → `core/nfqws` (+ chmod 755).
+///
+/// Версии ведутся раздельно: `version.txt` (Flowseal) и `nfqws-version.txt` (bol-van).
+#[cfg(not(windows))]
+fn download_core_linux(
+    target: &std::path::Path,
+    log_tx: &Sender<String>,
+) -> Result<String, String> {
+    let agent = host().agent();
+    let dl = host().download_agent();
+
+    // 1) Ассеты Flowseal.
+    let _ = log_tx.send("ядро: проверяю релиз Flowseal…".to_owned());
+    let fs = updater::check_latest(&agent)?;
+    let _ = log_tx.send(format!("ядро: качаю ассеты Flowseal {}…", fs.tag));
+    let fs_zip = std::env::temp_dir().join("zaprust_flowseal.zip");
+    download_with_progress(&dl, &fs.zip_url, &fs_zip, log_tx, "ядро (Flowseal)")?;
+    updater::apply(target, &fs_zip)?;
+    updater::write_version(target, &fs.tag)?;
+
+    // 2) Движок nfqws (bol-van/zapret).
+    let _ = log_tx.send("ядро: проверяю релиз bol-van/zapret (nfqws)…".to_owned());
+    let bv = updater::check_latest_nfqws(&agent)?;
+    let _ = log_tx.send(format!("ядро: качаю nfqws {}…", bv.tag));
+    let bv_zip = std::env::temp_dir().join("zaprust_nfqws.zip");
+    download_with_progress(&dl, &bv.zip_url, &bv_zip, log_tx, "ядро (nfqws)")?;
+    updater::extract_nfqws(&bv_zip, target)?;
+    updater::write_nfqws_version(target, &bv.tag)?;
+
+    let _ = std::fs::remove_file(&fs_zip);
+    let _ = std::fs::remove_file(&bv_zip);
+    Ok(format!("установлено: Flowseal {} + nfqws {}", fs.tag, bv.tag))
+}
+
+/// Скачать файл с логом прогресса (каждые ~20%). Общий помощник для получения и
+/// обновления ядра.
+#[allow(dead_code)] // на Windows используется только частью путей
+fn download_with_progress(
+    agent: &ureq::Agent,
+    url: &str,
+    dest: &std::path::Path,
+    log_tx: &Sender<String>,
+    what: &str,
+) -> Result<(), String> {
+    let mut last_pct: u64 = 0;
+    updater::download(agent, url, dest, |done, total| {
+        if let Some(t) = total.filter(|t| *t > 0) {
+            let pct = done * 100 / t;
+            if pct >= last_pct + 20 {
+                last_pct = pct;
+                let _ = log_tx.send(format!("{what}: скачано {pct}%"));
+            }
+        }
+    })
+}
+
+/// Windows: первая установка ядра Flowseal. Пытаемся без прав; если папка непишемая
+/// (Program Files) — через элевацию (UAC).
+#[cfg(windows)]
+fn download_core_windows(
+    target: &std::path::Path,
+    log_tx: &Sender<String>,
+) -> Result<String, String> {
+    let agent = host().agent();
     let _ = log_tx.send("ядро: проверяю последний релиз Flowseal…".to_owned());
     let latest = updater::check_latest(&agent)?;
     let _ = log_tx.send(format!("ядро: скачиваю {}…", latest.tag));
 
     let zip_path = std::env::temp_dir().join("zaprust_core_download.zip");
+    let dl = host().download_agent();
     let mut last_pct: u64 = 0;
-    updater::download(&agent, &latest.zip_url, &zip_path, |done, total| {
+    updater::download(&dl, &latest.zip_url, &zip_path, |done, total| {
         if let Some(t) = total.filter(|t| *t > 0) {
             let pct = done * 100 / t;
             if pct >= last_pct + 20 {
@@ -2073,7 +2452,7 @@ fn download_core_impl(target: &std::path::Path, log_tx: &Sender<String>) -> Resu
             // Вероятно нет прав на запись — пробуем через элевацию (UAC).
             let _ = log_tx.send(format!("ядро: прямая установка не вышла ({e}), пробую с UAC…"));
             let zip_str = zip_path.to_string_lossy().to_string();
-            match run_elevated_self(&["--apply-update", &zip_str, &latest.tag]) {
+            match host().run_elevated_self(&["--apply-update", &zip_str, &latest.tag]) {
                 Ok(0) => Ok(format!("установлено {}", latest.tag)),
                 Ok(code) => {
                     for line in read_svc_log() {
@@ -2087,8 +2466,89 @@ fn download_core_impl(target: &std::path::Path, log_tx: &Sender<String>) -> Resu
     }
 }
 
-/// Элевированный воркер замены ядра. args: [zip, tag, strategy?, gf?].
+/// Элевированный воркер замены ядра.
+/// Windows: args = [zip, tag, strategy?, gf?].
+/// Linux:   args = [flowseal_zip|-, flowseal_tag, nfqws_zip|-, nfqws_tag, strategy?, gf?].
 fn apply_update_command(args: &[String]) -> i32 {
+    #[cfg(not(windows))]
+    {
+        apply_update_linux(args)
+    }
+    #[cfg(windows)]
+    {
+        apply_update_windows(args)
+    }
+}
+
+/// Linux: под root заменить движок/ассеты из переданных zip'ов («-» = пропустить
+/// источник), вернув файлы во владение исходному пользователю, и перезапустить
+/// службу. Демон/правила гасятся ДО замены (запущенный nfqws заменять некорректно).
+#[cfg(not(windows))]
+fn apply_update_linux(args: &[String]) -> i32 {
+    let _ = std::fs::remove_file(svc_log_path());
+
+    let skip = |a: Option<&String>| -> Option<String> {
+        a.filter(|s| s.as_str() != "-" && !s.is_empty()).cloned()
+    };
+    let fs_zip = skip(args.first());
+    let fs_tag = args.get(1).cloned().unwrap_or_default();
+    let bv_zip = skip(args.get(2));
+    let bv_tag = args.get(3).cloned().unwrap_or_default();
+    let strategy = args.get(4).cloned();
+    let game_filter = args.get(5).map(|s| s == "1").unwrap_or(false);
+
+    if fs_zip.is_none() && bv_zip.is_none() {
+        write_svc_log("нечего заменять (оба источника пропущены)");
+        return 1;
+    }
+
+    let core_dir = host().core_dir().unwrap_or_else(|| host().preferred_core_dir());
+
+    // Останавливаем службу и гасим демон/правила ДО замены файлов.
+    let was_running = host().state().installed();
+    if was_running {
+        let _ = host().remove();
+    }
+    host().reset_engine();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    if let Some(zip) = &fs_zip {
+        if let Err(e) = updater::apply(&core_dir, std::path::Path::new(zip)) {
+            write_svc_log(&format!("замена ассетов Flowseal: {e}"));
+            return 1;
+        }
+        if let Err(e) = updater::write_version(&core_dir, &fs_tag) {
+            write_svc_log(&format!("запись версии Flowseal: {e}"));
+        }
+    }
+    if let Some(zip) = &bv_zip {
+        if let Err(e) = updater::extract_nfqws(std::path::Path::new(zip), &core_dir) {
+            write_svc_log(&format!("замена nfqws: {e}"));
+            return 1;
+        }
+        if let Err(e) = updater::write_nfqws_version(&core_dir, &bv_tag) {
+            write_svc_log(&format!("запись версии nfqws: {e}"));
+        }
+    }
+
+    // Файлы создавались под root — вернуть владельца исходному пользователю, иначе
+    // неэлевированный GUI/nfqws (--uid) не прочитает ядро в домашнем каталоге.
+    host().fixup_owner(&core_dir);
+
+    if was_running {
+        if let Some(name) = strategy {
+            if let Err(e) = host().install(&name, game_filter) {
+                write_svc_log(&format!("перезапуск службы: {e}"));
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Windows: элевированный воркер замены ядра. args: [zip, tag, strategy?, gf?].
+#[cfg(windows)]
+fn apply_update_windows(args: &[String]) -> i32 {
     let _ = std::fs::remove_file(svc_log_path());
 
     let Some(zip) = args.first() else {
@@ -2100,15 +2560,16 @@ fn apply_update_command(args: &[String]) -> i32 {
     let game_filter = args.get(3).map(|s| s == "1").unwrap_or(false);
 
     // Для первой установки папки core может ещё не быть — берём предпочтительную.
-    let core_dir = strategies::find_core_dir().unwrap_or_else(strategies::preferred_core_dir);
+    let core_dir = host().core_dir().unwrap_or_else(|| host().preferred_core_dir());
 
-    // Снимаем блокировку файлов: если служба стоит — удаляем (winws отпустит exe).
-    let was_running = service::query(service::SERVICE_NAME).installed();
+    // Снимаем блокировку файлов: если служба стоит — удаляем (движок отпустит файлы).
+    let was_running = host().state().installed();
     if was_running {
-        let _ = service::remove();
+        let _ = host().remove();
     }
-    // Выгружаем драйвер WinDivert — иначе WinDivert64.sys/.dll заняты и не заменятся.
-    service::stop_driver();
+    // Сбрасываем движок перехвата — иначе файлы ядра заняты и не заменятся
+    // (Win: выгрузка драйвера WinDivert).
+    host().reset_engine();
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     // Заменяем ядро целиком (с сохранением *-user.txt).
@@ -2123,7 +2584,7 @@ fn apply_update_command(args: &[String]) -> i32 {
     // Поднимаем обход заново на той же стратегии (если был запущен).
     if was_running {
         if let Some(name) = strategy {
-            match install_service_elevated(&name, game_filter) {
+            match host().install(&name, game_filter) {
                 Ok(()) => {}
                 Err(e) => {
                     write_svc_log(&format!("перезапуск службы: {e}"));
@@ -2137,7 +2598,7 @@ fn apply_update_command(args: &[String]) -> i32 {
 
 // ── Автоподбор стратегии (killer-фича) ───────────────────────────────────────
 
-/// Прогрев winws перед замером (драйвер WinDivert привязывается).
+/// Прогрев движка перед замером (на Windows за это время привязывается WinDivert).
 const WARMUP_MS: u64 = 900;
 
 /// Контрольные цели для отбора (минимум): YouTube + Discord по TLS.
@@ -2149,10 +2610,10 @@ fn autoselect_targets() -> Vec<Probe> {
 }
 
 fn autoselect_progress_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("zaprust_autoselect.jsonl")
+    handshake_dir().join("zaprust_autoselect.jsonl")
 }
 fn autoselect_cancel_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("zaprust_autoselect.cancel")
+    handshake_dir().join("zaprust_autoselect.cancel")
 }
 
 /// Прогресс одной итерации подбора (JSONL: элевированный пишет, GUI читает).
@@ -2194,75 +2655,6 @@ fn median(v: &[u128]) -> u128 {
     s[s.len() / 2]
 }
 
-/// Создать недостающие пользовательские списки (`*-user.txt`), на которые ссылаются
-/// аргументы winws. Оригинальные `.bat` Flowseal создают их пустыми через
-/// `service.bat load_user_lists`; мы запускаем winws напрямую, поэтому делаем сами.
-/// Без этого winws на отсутствующем `--ipset-exclude=…-user.txt` падает с кодом 1.
-fn ensure_user_lists(args: &[String]) {
-    for a in args {
-        let path = a.rsplit('=').next().unwrap_or(a).trim_matches('"');
-        if !path.ends_with("-user.txt") {
-            continue;
-        }
-        let p = std::path::Path::new(path);
-        if p.exists() {
-            continue;
-        }
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match std::fs::write(p, b"") {
-            Ok(_) => logging::info("lists", format!("создан недостающий список: {path}")),
-            Err(e) => logging::warn("lists", format!("не создать список {path}: {e}")),
-        }
-    }
-}
-
-/// Файл, куда пишется вывод winws при пробах (для диагностики кода выхода).
-fn winws_output_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("zaprust_winws.out")
-}
-
-/// Последние строки вывода winws (его собственная диагностика об ошибке).
-fn winws_last_output() -> String {
-    std::fs::read_to_string(winws_output_path())
-        .map(|t| {
-            t.lines()
-                .filter(|l| !l.trim().is_empty())
-                .rev()
-                .take(12)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join(" | ")
-        })
-        .unwrap_or_default()
-}
-
-/// Спавн winws скрыто (CREATE_NO_WINDOW). stdout+stderr → temp-файл (безопасно,
-/// в отличие от недренируемого пайпа), чтобы видеть причину кода выхода winws.
-fn spawn_winws(core_dir: &std::path::Path, args: &[String]) -> std::io::Result<std::process::Child> {
-    let bin_dir = core_dir.join("bin");
-    let exe = bin_dir.join("winws.exe");
-    let mut cmd = Command::new(&exe);
-    cmd.args(args).current_dir(&bin_dir).stdin(Stdio::null());
-    match std::fs::File::create(winws_output_path()) {
-        Ok(file) => {
-            let err = file.try_clone().map(Stdio::from).unwrap_or_else(|_| Stdio::null());
-            cmd.stdout(Stdio::from(file)).stderr(err);
-        }
-        Err(_) => {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    cmd.spawn()
-}
 
 /// Параллельно замерить цели: вернуть (достижимо, мс, причина) по каждой в исходном порядке.
 fn measure_targets(targets: &[Probe], agent: &ureq::Agent) -> Vec<(bool, u128, String)> {
@@ -2280,34 +2672,32 @@ fn measure_targets(targets: &[Probe], agent: &ureq::Agent) -> Vec<(bool, u128, S
 
 /// Проба одной стратегии: spawn → warmup → гейт по целям (fail-fast) →
 /// при успехе ещё 2 замера на цель → медиана. Возвращает сумму медиан-пингов
-/// (None — стратегия не пробила). Драйвер WinDivert НЕ выгружается.
+/// (None — стратегия не пробила). Движок поднимается через BypassRuntime; его
+/// сворачивание — в Drop хэндла (драйвер/правила между пробами не трогаем).
 fn probe_strategy(
-    core_dir: &std::path::Path,
     s: &strategies::Strategy,
     game_filter: bool,
     targets: &[Probe],
     agent: &ureq::Agent,
 ) -> Option<u32> {
-    let args = strategies::resolve_game_filter(&s.args, game_filter);
-    let mut child = match spawn_winws(core_dir, &args) {
-        Ok(c) => c,
+    let mut handle = match host().spawn_probe(s, game_filter) {
+        Ok(h) => h,
         Err(e) => {
-            logging::error("autoselect", format!("[{}] не запустился winws: {e}", s.name));
+            logging::error("autoselect", format!("[{}] не запустился движок: {e}", s.name));
             return None;
         }
     };
-    std::thread::sleep(Duration::from_millis(WARMUP_MS)); // прогрев — WinDivert привязывается
+    std::thread::sleep(Duration::from_millis(WARMUP_MS)); // прогрев движка перехвата
 
-    // Если winws мгновенно умер — частая причина (AV/драйвер/аргументы).
-    if let Ok(Some(status)) = child.try_wait() {
-        let out = winws_last_output();
+    // Если движок мгновенно умер — частая причина (AV/драйвер/аргументы).
+    if let Some(code) = handle.try_exit() {
+        let out = host().last_engine_output();
         logging::error(
             "autoselect",
             format!(
-                "[{}] winws сразу вышел (код {:?}){}",
+                "[{}] движок сразу вышел (код {code}){}",
                 s.name,
-                status.code(),
-                if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
+                if out.is_empty() { String::new() } else { format!(" · {out}") }
             ),
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -2347,28 +2737,24 @@ fn probe_strategy(
         None
     };
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(handle); // свернуть прогон движка (Drop глушит процесс)
     std::thread::sleep(Duration::from_millis(250)); // settle (драйвер не трогаем)
     ping
 }
 
 /// Финальная верификация победителя полным targets.txt: ≥70% целей доступны.
 fn verify_winner(
-    core_dir: &std::path::Path,
     s: &strategies::Strategy,
     game_filter: bool,
     full: &[Probe],
     agent: &ureq::Agent,
 ) -> bool {
-    let args = strategies::resolve_game_filter(&s.args, game_filter);
-    let Ok(mut child) = spawn_winws(core_dir, &args) else {
+    let Ok(handle) = host().spawn_probe(s, game_filter) else {
         return false;
     };
     std::thread::sleep(Duration::from_millis(WARMUP_MS));
     let results = measure_targets(full, agent);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(handle);
     std::thread::sleep(Duration::from_millis(250));
 
     let ok = results.iter().filter(|(o, _, _)| *o).count();
@@ -2418,9 +2804,9 @@ fn load_targets_file(core_dir: &std::path::Path) -> Vec<Probe> {
     autoselect_targets()
 }
 
-/// Установить победителя службой (start=auto) + метка в реестр.
+/// Установить победителя службой (start=auto) + метка стратегии.
 fn install_winner(name: &str, game_filter: bool) -> i32 {
-    match install_service_elevated(name, game_filter) {
+    match host().install(name, game_filter) {
         Ok(()) => {
             logging::info("autoselect", format!("победитель установлен: {name}"));
             write_progress(&AutoProgress {
@@ -2453,7 +2839,7 @@ fn write_list_with_fallback(dest: &std::path::Path, content: &[u8]) -> Result<()
     std::fs::write(&tmp, content).map_err(|e| format!("временный файл: {e}"))?;
     let dest_s = dest.to_string_lossy().to_string();
     let tmp_s = tmp.to_string_lossy().to_string();
-    match run_elevated_self(&["--write-list", &dest_s, &tmp_s]) {
+    match host().run_elevated_self(&["--write-list", &dest_s, &tmp_s]) {
         Ok(0) => Ok(()),
         Ok(code) => Err(format!("запись не удалась (код {code})")),
         Err(e) => Err(e),
@@ -2485,7 +2871,7 @@ fn autoselect_command(args: &[String]) -> i32 {
     let _ = std::fs::remove_file(autoselect_cancel_path());
     let _ = std::fs::remove_file(svc_log_path());
 
-    let scan = strategies::scan();
+    let scan = host().scan();
     let Some(core_dir) = scan.core_dir.clone() else {
         write_svc_log("ядро не найдено");
         return 1;
@@ -2498,69 +2884,17 @@ fn autoselect_command(args: &[String]) -> i32 {
     let ordered = order_strategies(&scan.strategies, lkg.as_deref());
     let total = ordered.len();
     let sel = autoselect_targets();
-    let agent = build_probe_agent();
+    let agent = host().probe_agent();
     logging::info(
         "autoselect",
         format!("старт: {total} стратегий, game_filter={game_filter}, lkg={lkg:?}"),
     );
 
-    // Создаём недостающие *-user.txt для всех стратегий: иначе winws каждой пробы
-    // падает с кодом 1 на отсутствующем ipset-файле (на свежем ядре их нет).
-    for s in &ordered {
-        ensure_user_lists(&strategies::resolve_game_filter(&s.args, game_filter));
-    }
-
-    // КРИТИЧНО: снимаем уже стоящую службу/процесс winws перед подбором — иначе
-    // их winws держит WinDivert, и winws КАЖДОЙ пробы конфликтует и падает (код 1).
-    if service::query(service::SERVICE_NAME).installed() || service::winws_alive().is_some() {
-        logging::info("autoselect", "снимаю активную службу/winws перед подбором");
-        let _ = service::remove();
-        std::thread::sleep(Duration::from_millis(600));
-    }
-    // И сбрасываем сам драйвер WinDivert: прошлый winws (в т.ч. упавший/убитый при
-    // ручном старте) мог оставить драйвер в занятом состоянии — тогда КАЖДЫЙ
-    // следующий winws падает с кодом 1. Чистый старт драйвера снимает это.
-    logging::info("autoselect", "сброс драйвера WinDivert перед подбором");
-    service::stop_driver();
-    std::thread::sleep(Duration::from_millis(800));
-
-    // Прайм драйвера WinDivert: на чистой машине ПЕРВЫЙ запуск winws ставит/грузит
-    // драйвер заметно дольше прогрева — поднимаем winws один раз и ждём, иначе
-    // первые (а то и все) пробы падают из-за непрогретого драйвера. Заодно ловим
-    // вывод winws — если он сразу падает, тут будет видна настоящая причина.
-    if let Some(first) = ordered.first() {
-        let pargs = strategies::resolve_game_filter(&first.args, game_filter);
-        match spawn_winws(&core_dir, &pargs) {
-            Ok(mut c) => {
-                logging::info("autoselect", "прайм WinDivert: winws поднят, жду 1800мс");
-                std::thread::sleep(Duration::from_millis(1800));
-                let early = c.try_wait().ok().flatten();
-                let _ = c.kill();
-                let _ = c.wait();
-                std::thread::sleep(Duration::from_millis(300));
-                let out = winws_last_output();
-                match early {
-                    Some(st) => logging::error(
-                        "autoselect",
-                        format!(
-                            "прайм: winws сразу вышел (код {:?}){}",
-                            st.code(),
-                            if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
-                        ),
-                    ),
-                    None => logging::info(
-                        "autoselect",
-                        format!(
-                            "прайм завершён, WinDivert: {:?}{}",
-                            service::query("WinDivert"),
-                            if out.is_empty() { String::new() } else { format!(" · winws: {out}") }
-                        ),
-                    ),
-                }
-            }
-            Err(e) => logging::error("autoselect", format!("прайм: winws не запустился: {e}")),
-        }
-    }
+    // Подготовка свипа платформой: создать недостающие вспомогательные списки,
+    // снять активный обход, сбросить и прогреть движок перехвата. На Windows это
+    // ровно прежняя последовательность (ensure_user_lists + reset WinDivert +
+    // прайм); на Linux позже — поднятие правил nftables.
+    host().prepare_sweep(&ordered, game_filter);
 
     // Быстрый путь: last-known-good. Прошёл гейт → ставим сразу.
     if let Some(name) = &lkg {
@@ -2572,7 +2906,7 @@ fn autoselect_command(args: &[String]) -> i32 {
                 stage: "lkg".to_owned(),
                 ..Default::default()
             });
-            if probe_strategy(&core_dir, s, game_filter, &sel, &agent).is_some() {
+            if probe_strategy(s, game_filter, &sel, &agent).is_some() {
                 return install_winner(name, game_filter);
             }
         }
@@ -2582,10 +2916,15 @@ fn autoselect_command(args: &[String]) -> i32 {
     let mut candidates: Vec<(String, u32)> = Vec::new();
     for (i, s) in ordered.iter().enumerate() {
         if autoselect_canceled() {
+            // Активная уборка по отмене (а не только надежда на Drop прошлой пробы):
+            // глушим любой движок перехвата и снимаем правила, службу НЕ ставим.
+            // На Linux это критично — остаточные nft-правила исказили бы сеть.
+            host().reset_engine();
             write_progress(&AutoProgress {
                 stage: "canceled".to_owned(),
                 ..Default::default()
             });
+            logging::info("autoselect", "отменено пользователем — движок и правила сняты");
             return 2;
         }
         write_progress(&AutoProgress {
@@ -2596,7 +2935,7 @@ fn autoselect_command(args: &[String]) -> i32 {
             ..Default::default()
         });
 
-        match probe_strategy(&core_dir, s, game_filter, &sel, &agent) {
+        match probe_strategy(s, game_filter, &sel, &agent) {
             Some(ping) => {
                 candidates.push((s.name.clone(), ping));
                 write_progress(&AutoProgress {
@@ -2649,7 +2988,7 @@ fn autoselect_command(args: &[String]) -> i32 {
     });
     let full = load_targets_file(&core_dir);
     if let Some(ws) = ordered.iter().find(|s| s.name == winner) {
-        if !verify_winner(&core_dir, ws, game_filter, &full, &agent) {
+        if !verify_winner(ws, game_filter, &full, &agent) {
             write_progress(&AutoProgress {
                 stage: "none".to_owned(),
                 ..Default::default()
@@ -2661,78 +3000,15 @@ fn autoselect_command(args: &[String]) -> i32 {
     install_winner(&winner, game_filter)
 }
 
-/// Запущены ли мы с правами администратора.
-#[cfg(windows)]
-fn is_elevated() -> bool {
-    use std::ffi::c_void;
-    #[repr(C)]
-    struct TokenElevation {
-        token_is_elevated: u32,
-    }
-    const TOKEN_QUERY: u32 = 0x0008;
-    const TOKEN_ELEVATION: i32 = 20;
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn OpenProcessToken(process: *mut c_void, desired: u32, token: *mut *mut c_void) -> i32;
-        fn GetTokenInformation(
-            token: *mut c_void,
-            class: i32,
-            info: *mut c_void,
-            len: u32,
-            ret_len: *mut u32,
-        ) -> i32;
-    }
-    extern "system" {
-        fn GetCurrentProcess() -> *mut c_void;
-        fn CloseHandle(h: *mut c_void) -> i32;
-    }
-    unsafe {
-        let mut token: *mut c_void = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-        let mut elev = TokenElevation {
-            token_is_elevated: 0,
-        };
-        let mut ret = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TOKEN_ELEVATION,
-            &mut elev as *mut _ as *mut c_void,
-            std::mem::size_of::<TokenElevation>() as u32,
-            &mut ret,
-        );
-        CloseHandle(token);
-        ok != 0 && elev.token_is_elevated != 0
-    }
-}
-#[cfg(not(windows))]
-fn is_elevated() -> bool {
-    true
-}
-
-/// Версия Windows (через `cmd /c ver`).
-fn windows_version() -> String {
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/c", "ver"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    cmd.output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::consts::OS.to_owned())
-}
-
 /// Шапка окружения одной пачкой при старте каждого процесса.
 fn log_env_header() {
     let ver = env!("CARGO_PKG_VERSION");
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    logging::info("env", format!("Zaprust {ver} ({profile}), elevated={}", is_elevated()));
-    logging::info("env", format!("windows: {}", windows_version()));
+    logging::info("env", format!("Zaprust {ver} ({profile}), elevated={}", host().is_elevated()));
+    logging::info("env", format!("ос: {}", host().os_version()));
+    for line in host().diag_lines() {
+        logging::info("env", line);
+    }
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.display().to_string();
         logging::info("env", format!("exe: {p}"));
@@ -2740,24 +3016,14 @@ fn log_env_header() {
             logging::warn("env", "путь к exe содержит пробел/не-ASCII — zapret и служба могут не работать");
         }
     }
-    match strategies::find_core_dir() {
+    match host().core_dir() {
         Some(core) => {
             let cs = core.display().to_string();
             logging::info("env", format!("core: {cs}"));
             if cs.contains(' ') || !cs.is_ascii() {
                 logging::warn("env", "путь к core содержит пробел/не-ASCII");
             }
-            let bin = core.join("bin");
-            logging::info(
-                "env",
-                format!(
-                    "core: winws.exe={} WinDivert.dll={} WinDivert64.sys={} version={}",
-                    bin.join("winws.exe").exists(),
-                    bin.join("WinDivert.dll").exists(),
-                    bin.join("WinDivert64.sys").exists(),
-                    updater::local_version(&core).unwrap_or_else(|| "нет".to_owned())
-                ),
-            );
+            logging::info("env", format!("core: {}", host().engine_diag()));
         }
         None => logging::warn("env", "ядро не найдено (папка core/)"),
     }
@@ -2765,8 +3031,26 @@ fn log_env_header() {
 
 // ── Хэндшейк результата между процессами (фикс рассинхрона статуса) ──────────
 
+/// Каталог для межпроцессных файлов-хэндшейков между неэлевированным GUI и
+/// элевированным реинвоком. На Linux это ВСЕГДА `/tmp`: pkexec вычищает
+/// окружение, и `$TMPDIR` до реинвока не доезжает — он видит дефолтный /tmp.
+/// Закрепляем /tmp и на стороне GUI, иначе при заданном `$TMPDIR` стороны
+/// смотрели бы в разные каталоги. (Файлы, чей путь передаётся реинвоку
+/// аргументом — zip обновления, --write-list — этой проблемы не имеют.)
+/// На Windows процессы одного пользователя, обычный temp_dir подходит.
+fn handshake_dir() -> std::path::PathBuf {
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from("/tmp")
+    }
+    #[cfg(windows)]
+    {
+        std::env::temp_dir()
+    }
+}
+
 fn op_result_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("zaprust_result.json")
+    handshake_dir().join("zaprust_result.json")
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
@@ -2780,12 +3064,12 @@ struct OpResult {
 
 /// Элевированный реинвок пишет структурированный итог операции в общий temp.
 fn write_op_result(op: &str, ok: bool, error: Option<String>) {
-    let state = service::query(service::SERVICE_NAME);
+    let state = host().state();
     let r = OpResult {
         op: op.to_owned(),
         ok,
         service_state: format!("{state:?}"),
-        winws_pid: service::winws_alive(),
+        winws_pid: host().engine_alive(),
         error,
     };
     if let Ok(j) = serde_json::to_string(&r) {
@@ -2807,126 +3091,7 @@ fn read_op_result() -> Option<OpResult> {
         .and_then(|t| serde_json::from_str(&t).ok())
 }
 
-/// Авторитетная истина «обход работает»: служба RUNNING И процесс winws жив.
-fn authoritative_running() -> bool {
-    let svc = service::query(service::SERVICE_NAME) == ServiceState::Running;
-    let winws = service::winws_alive().is_some();
-    if svc != winws {
-        logging::warn(
-            "state",
-            format!("расхождение: служба RUNNING={svc}, winws жив={winws}"),
-        );
-    }
-    svc && winws
-}
-
-/// Перезапустить наш exe с правами администратора и дождаться завершения.
-/// Возвращает код выхода элевированного процесса.
-#[cfg(windows)]
-fn run_elevated_self(args: &[&str]) -> Result<i32, String> {
-    use std::ffi::{c_void, OsStr};
-    use std::os::windows::ffi::OsStrExt;
-
-    fn wide(s: &OsStr) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // Параметры: каждый аргумент с пробелом — в кавычках.
-    let params: String = args
-        .iter()
-        .map(|a| {
-            if a.contains(' ') {
-                format!("\"{a}\"")
-            } else {
-                a.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let verb = wide(OsStr::new("runas"));
-    let file = wide(exe.as_os_str());
-    let params_w = wide(OsStr::new(&params));
-
-    #[repr(C)]
-    struct ShellExecuteInfoW {
-        cb_size: u32,
-        f_mask: u32,
-        hwnd: *mut c_void,
-        lp_verb: *const u16,
-        lp_file: *const u16,
-        lp_parameters: *const u16,
-        lp_directory: *const u16,
-        n_show: i32,
-        h_inst_app: *mut c_void,
-        lp_id_list: *mut c_void,
-        lp_class: *const u16,
-        hkey_class: *mut c_void,
-        dw_hot_key: u32,
-        h_icon: *mut c_void,
-        h_process: *mut c_void,
-    }
-    const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
-    const SW_HIDE: i32 = 0;
-    const INFINITE: u32 = 0xFFFF_FFFF;
-
-    #[link(name = "shell32")]
-    extern "system" {
-        fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
-    }
-    extern "system" {
-        fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
-        fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
-        fn CloseHandle(h: *mut c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-
-    logging::info("elevate", format!("реинвок (UAC): {}", args.join(" ")));
-    unsafe {
-        let mut info: ShellExecuteInfoW = std::mem::zeroed();
-        info.cb_size = std::mem::size_of::<ShellExecuteInfoW>() as u32;
-        info.f_mask = SEE_MASK_NOCLOSEPROCESS;
-        info.lp_verb = verb.as_ptr();
-        info.lp_file = file.as_ptr();
-        info.lp_parameters = params_w.as_ptr();
-        info.n_show = SW_HIDE;
-
-        if ShellExecuteExW(&mut info) == 0 {
-            let err = GetLastError();
-            // ERROR_CANCELLED 1223 = пользователь нажал «Нет» в UAC.
-            let msg = if err == 1223 {
-                "элевация отклонена пользователем (UAC: Нет)".to_owned()
-            } else {
-                format!("элевация не удалась (GetLastError={err})")
-            };
-            logging::error("elevate", &msg);
-            return Err(msg);
-        }
-        if info.h_process.is_null() {
-            logging::warn("elevate", "нет hProcess для ожидания результата");
-            return Ok(0);
-        }
-        WaitForSingleObject(info.h_process, INFINITE);
-        let mut code: u32 = 0;
-        GetExitCodeProcess(info.h_process, &mut code);
-        CloseHandle(info.h_process);
-        logging::info("elevate", format!("реинвок завершён, код={code}"));
-        Ok(code as i32)
-    }
-}
-
-#[cfg(not(windows))]
-fn run_elevated_self(_args: &[&str]) -> Result<i32, String> {
-    Err("элевация поддерживается только на Windows".to_owned())
-}
-
 // ── Диагностика (D) ──────────────────────────────────────────────────────────
-
-/// Открыть путь в проводнике.
-fn open_in_explorer(path: &std::path::Path) {
-    let _ = Command::new("explorer").arg(path).spawn();
-}
 
 /// Текст диагностики: шапка окружения + последние проблемы из лога.
 fn diagnostics_text() -> String {
@@ -2936,28 +3101,34 @@ fn diagnostics_text() -> String {
         env!("CARGO_PKG_VERSION"),
         if cfg!(debug_assertions) { "debug" } else { "release" }
     ));
-    s.push_str(&format!("elevated: {}\n", is_elevated()));
-    s.push_str(&format!("windows: {}\n", windows_version()));
+    s.push_str(&format!("elevated: {}\n", host().is_elevated()));
+    s.push_str(&format!("ос: {}\n", host().os_version()));
+    for line in host().diag_lines() {
+        s.push_str(&line);
+        s.push('\n');
+    }
     if let Ok(exe) = std::env::current_exe() {
         s.push_str(&format!("exe: {}\n", exe.display()));
     }
-    if let Some(core) = strategies::find_core_dir() {
-        let bin = core.join("bin");
+    if let Some(core) = host().core_dir() {
         s.push_str(&format!("core: {}\n", core.display()));
         s.push_str(&format!(
-            "core ready: winws={} dll={} sys={} version={}\n",
-            bin.join("winws.exe").exists(),
-            bin.join("WinDivert.dll").exists(),
-            bin.join("WinDivert64.sys").exists(),
-            updater::local_version(&core).unwrap_or_else(|| "нет".to_owned())
+            "версия Flowseal: {}\n",
+            updater::local_version(&core).as_deref().unwrap_or("нет")
         ));
+        #[cfg(not(windows))]
+        s.push_str(&format!(
+            "версия nfqws: {}\n",
+            updater::local_nfqws_version(&core).as_deref().unwrap_or("нет")
+        ));
+        s.push_str(&format!("core ready: {}\n", host().engine_diag()));
     } else {
         s.push_str("core: не найдено\n");
     }
     s.push_str(&format!(
-        "service: {:?}, winws_alive: {:?}\n",
-        service::query(service::SERVICE_NAME),
-        service::winws_alive()
+        "service: {:?}, engine_alive: {:?}\n",
+        host().state(),
+        host().engine_alive()
     ));
     if let Some(p) = logging::log_path() {
         s.push_str(&format!("log: {}\n", p.display()));
@@ -2968,56 +3139,6 @@ fn diagnostics_text() -> String {
         s.push('\n');
     }
     s
-}
-
-/// Положить текст в буфер обмена (CF_UNICODETEXT).
-#[cfg(windows)]
-fn set_clipboard(text: &str) -> bool {
-    use std::ffi::{c_void, OsStr};
-    use std::os::windows::ffi::OsStrExt;
-    const CF_UNICODETEXT: u32 = 13;
-    const GMEM_MOVEABLE: u32 = 0x0002;
-    #[link(name = "user32")]
-    extern "system" {
-        fn OpenClipboard(h: *mut c_void) -> i32;
-        fn EmptyClipboard() -> i32;
-        fn SetClipboardData(fmt: u32, mem: *mut c_void) -> *mut c_void;
-        fn CloseClipboard() -> i32;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
-        fn GlobalLock(h: *mut c_void) -> *mut c_void;
-        fn GlobalUnlock(h: *mut c_void) -> i32;
-    }
-    let wide: Vec<u16> = OsStr::new(text)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return false;
-        }
-        EmptyClipboard();
-        let h = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
-        if h.is_null() {
-            CloseClipboard();
-            return false;
-        }
-        let p = GlobalLock(h) as *mut u16;
-        if !p.is_null() {
-            std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
-            GlobalUnlock(h);
-        }
-        SetClipboardData(CF_UNICODETEXT, h);
-        CloseClipboard();
-        true
-    }
-}
-
-#[cfg(not(windows))]
-fn set_clipboard(_text: &str) -> bool {
-    false
 }
 
 /// Тёмная плоская тема.

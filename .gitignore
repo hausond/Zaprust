@@ -1,22 +1,22 @@
 # ── Build artifacts ──────────────────────────────────────────────
-/zaprust/target/
-target/
+/target
 
-# ── Packaged builds ──────────────────────────────────────────────
-/dist/
+# ── Packaged builds (AppImage, portable-zip, AppDir) ─────────────
+/dist
 
 # ── Runtime / local ──────────────────────────────────────────────
-logs/
+/logs
 *.log
 
-# Ядро zapret (сборка Flowseal) кладётся вручную при разработке либо
-# тянется кнопкой «Скачать ядро»; в репозитории не хранится.
-/zaprust/core/
+# Ядро zapret (стратегии Flowseal + движок) кладётся сюда вручную при
+# разработке либо тянется кнопкой «Скачать ядро»; в репозитории не хранится.
+/core
 
 # ── Editor / OS / agent ──────────────────────────────────────────
 /.claude/
 .vscode/
 .idea/
 *.swp
+.DS_Store
 Thumbs.db
 desktop.ini

@@ -1,38 +1,16 @@
-// Core-слой: поиск папки ядра zapret (сборка Flowseal) и парсинг стратегий
-// из `general*.bat`. Парсер намеренно «терпимый»: формат батников Flowseal
-// меняется между релизами, поэтому битый файл просто пропускается, а не роняет
-// приложение.
+// Источник стратегий на Windows: поиск папки ядра zapret (сборка Flowseal) и
+// парсинг стратегий из `general*.bat`. Парсер намеренно «терпимый»: формат
+// батников Flowseal меняется между релизами, поэтому битый файл просто
+// пропускается, а не роняет приложение.
+//
+// На Linux источником станет нативный bol-van/zapret (шаг L3) — поэтому весь
+// этот `.bat`-специфичный разбор живёт в платформенном слое Windows, а общими
+// остаются только типы `Strategy` / `CoreScan` (модуль `crate::strategies`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Одна стратегия = набор аргументов для winws.exe, вытащенный из .bat.
-#[derive(Clone, Debug)]
-pub struct Strategy {
-    /// Человекочитаемое имя (из имени файла без расширения).
-    pub name: String,
-    /// Группа для дропдауна: general / ALT / FAKE TLS / Simple Fake / …
-    pub group: String,
-    /// Откуда взято (используется на следующих шагах — запуск/отладка).
-    #[allow(dead_code)]
-    pub source_path: PathBuf,
-    /// Разобранные аргументы winws (понадобятся на шаге 3 для запуска).
-    pub args: Vec<String>,
-    /// Исходная строка аргументов (для отладки).
-    #[allow(dead_code)]
-    pub raw_args: String,
-}
-
-/// Результат сканирования папки ядра.
-#[derive(Clone, Debug, Default)]
-pub struct CoreScan {
-    /// Найденная папка ядра (если есть).
-    pub core_dir: Option<PathBuf>,
-    /// Успешно распарсенные стратегии, отсортированные по группам.
-    pub strategies: Vec<Strategy>,
-    /// Сообщения о проблемах (пропущенные файлы и т.п.) — для лога.
-    pub messages: Vec<String>,
-}
+use crate::strategies::{CoreScan, Strategy};
 
 /// Найти папку ядра. Приоритет — рядом с исполняемым файлом (релизный layout),
 /// затем dev-фолбэки (рядом с Cargo.toml и в рабочей директории).
@@ -183,6 +161,9 @@ pub fn parse_bat(path: &Path, core_dir: &Path) -> Result<Strategy, String> {
         source_path: path.to_path_buf(),
         args,
         raw_args,
+        // Windows: перехват задаёт сам winws (--wf-* в args), отдельные порты не нужны.
+        wf_tcp: Vec::new(),
+        wf_udp: Vec::new(),
     })
 }
 

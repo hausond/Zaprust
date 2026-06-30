@@ -7,32 +7,14 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::platform::ServiceState;
+
 /// Имя службы (как у Flowseal).
 pub const SERVICE_NAME: &str = "zapret";
 
-/// Состояние службы / драйвера (по `sc query`).
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub enum ServiceState {
-    #[default]
-    Unknown,
-    Running,
-    Stopped,
-    NotInstalled,
-}
-
-impl ServiceState {
-    /// Установлена ли служба (в любом рабочем состоянии).
-    pub fn installed(self) -> bool {
-        matches!(self, ServiceState::Running | ServiceState::Stopped)
-    }
-}
-
 fn no_window(cmd: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 }
 
 /// Состояние службы по имени (read-only, прав админа не требует).
